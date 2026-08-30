@@ -1,0 +1,15 @@
+
+:root{font-family:Inter,system-ui,Arial,sans-serif;color:#f4f6fb;background:#0b0e13}
+*{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at top,#171d29,#0b0e13 45%);min-height:100vh}
+.wrap{max-width:1180px;margin:auto;padding:22px} header{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:22px}
+h1{font-size:30px;margin:0}h1 span{color:#ffd34e}header p{color:#8f9bad;margin:7px 0 0}
+.badge{padding:10px 15px;border-radius:999px;font-weight:800}.badge.off{background:#35232a;color:#ff7f91}.badge.on{background:#153727;color:#55e69c}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.cards article,.panel{background:#121721;border:1px solid #222b39;border-radius:17px;padding:18px;box-shadow:0 12px 40px #0004}
+.cards small{display:block;color:#8693a8;margin-bottom:8px}.cards strong{font-size:20px}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}.toolbar button,button{border:0;border-radius:12px;padding:12px 15px;background:#252e3d;color:#fff;font-weight:800;cursor:pointer}
+button.primary{background:#ffd34e;color:#17140a}button.trade{background:#2d6cf6}
+.grid{display:grid;grid-template-columns:1.6fr .8fr;gap:14px;margin-bottom:14px}.panel h2{margin:0 0 15px;font-size:18px}.panel-title{display:flex;justify-content:space-between;align-items:center}.panel-title span{color:#7f8da1;font-size:13px}
+.signal{display:grid;grid-template-columns:1fr auto;gap:10px;padding:14px 0;border-bottom:1px solid #202837}.signal:last-child{border:0}.symbol{font-weight:850;font-size:17px}.meta{font-size:12px;color:#8793a5;margin-top:5px}.score{font-size:20px;font-weight:900}.call{color:#4ee89b}.put{color:#ff687b}.reasons{color:#9aa7ba;font-size:12px;margin-top:6px;line-height:1.5}
+form{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{font-size:12px;color:#9ba6b8}input{width:100%;margin-top:5px;padding:10px;background:#0c1119;color:#fff;border:1px solid #283244;border-radius:9px}form button{grid-column:1/-1}
+.note{font-size:12px;color:#8390a3;line-height:1.5}.history-row{display:grid;grid-template-columns:1.4fr .8fr .8fr .8fr .8fr;gap:8px;border-bottom:1px solid #202837;padding:10px 0;font-size:13px}.empty{color:#738096;padding:25px;text-align:center}
+@media(max-width:800px){.cards{grid-template-columns:1fr 1fr}.grid{grid-template-columns:1fr}header{align-items:flex-start}h1{font-size:24px}.history-row{grid-template-columns:1fr 1fr}.history-row span:nth-child(n+3){font-size:12px}.toolbar button{flex:1 1 45%}}

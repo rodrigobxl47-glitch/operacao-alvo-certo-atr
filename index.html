@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#10131a">
+  <link rel="manifest" href="/static/manifest.json">
+  <link rel="stylesheet" href="/static/style.css">
+  <title>Operação Alvo Certo (ATR)</title>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Operação Alvo Certo <span>(ATR)</span></h1>
+      <p>Scanner multiativos • M1 + M15 • DEMO / Paper Trading</p>
+    </div>
+    <div id="robotBadge" class="badge off">PARADO</div>
+  </header>
+
+  <section class="cards">
+    <article><small>Banca</small><strong id="balance">R$ 0,00</strong></article>
+    <article><small>Resultado</small><strong id="pnl">0,00%</strong></article>
+    <article><small>Entradas</small><strong id="entries">0</strong></article>
+    <article><small>Status</small><strong id="status">Parado</strong></article>
+  </section>
+
+  <section class="toolbar">
+    <button class="primary" onclick="scan()">🔎 Analisar todos os ativos</button>
+    <button onclick="startRobot()">▶ Iniciar</button>
+    <button onclick="stopRobot()">■ Parar</button>
+    <button class="trade" onclick="paperEntry()">🎯 Entrada DEMO no melhor sinal</button>
+  </section>
+
+  <section class="grid">
+    <article class="panel">
+      <div class="panel-title"><h2>Melhores oportunidades</h2><span id="lastScan">—</span></div>
+      <div id="signals" class="signals"><div class="empty">Clique em “Analisar todos os ativos”.</div></div>
+    </article>
+
+    <article class="panel">
+      <h2>Gerenciamento</h2>
+      <form id="cfg" onsubmit="saveConfig(event)">
+        <label>Banca inicial <input id="banca" type="number" step="0.01" value="1000"></label>
+        <label>Entrada (% banca) <input id="percent" type="number" step="0.1" value="1"></label>
+        <label>Score mínimo <input id="score" type="number" min="1" max="12" value="7"></label>
+        <label>Stop Gain (%) <input id="sg" type="number" step="0.1" value="5"></label>
+        <label>Stop Loss (%) <input id="sl" type="number" step="0.1" value="5"></label>
+        <label>Máx. entradas <input id="maxe" type="number" value="5"></label>
+        <label>Duração (min) <input id="dur" type="number" value="1"></label>
+        <button class="primary" type="submit">Salvar configurações</button>
+      </form>
+      <p class="note">Esta versão não envia ordens de dinheiro real. Ela analisa dados públicos da Deriv e registra entradas em modo DEMO/Paper.</p>
+    </article>
+  </section>
+
+  <section class="panel">
+    <h2>Histórico DEMO</h2>
+    <div id="history" class="history"><div class="empty">Nenhuma entrada registrada.</div></div>
+  </section>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
