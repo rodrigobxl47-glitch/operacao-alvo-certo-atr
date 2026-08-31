@@ -284,8 +284,7 @@ async def candles(
             "count": count,
             "end": "latest",
             "granularity": 60,
-            "style": "candles",
-            "subscribe": 0
+            "style": "candles"
         }
     )
 
