@@ -15,18 +15,24 @@ app = FastAPI(title="Operação Alvo Certo (ATR)")
 PUBLIC_WS = "wss://api.derivws.com/trading/v1/options/ws/public"
 
 
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
 class Config(BaseModel):
     banca_inicial: float = 1000.0
     percentual_entrada: float = 1.0
     stop_gain: float = 5.0
     stop_loss: float = 5.0
     max_entradas: int = 5
-    min_score: int = 7
+    min_score: int = 5
     duracao_minutos: int = 1
     payout_demo: float = 0.80
+    intervalo_entre_ativos_ms: int = 120
 
 
 config = Config()
+
 
 state = {
     "running": False,
@@ -44,6 +50,10 @@ state = {
 robot_task: Optional[asyncio.Task] = None
 scan_lock = asyncio.Lock()
 
+
+# ============================================================
+# MODELOS
+# ============================================================
 
 @dataclass
 class Candle:
@@ -67,70 +77,193 @@ class Signal:
     resistance: float = 0.0
 
 
-def ema(values: List[float], period: int) -> List[float]:
+# ============================================================
+# CONEXÃO DERIV
+# Uma única conexão reutilizada
+# ============================================================
+
+class DerivPublicClient:
+    def __init__(self):
+        self.ws = None
+        self.lock = asyncio.Lock()
+        self.req_id = 1000
+
+    async def connect(self):
+        if self.ws is not None:
+            try:
+                if not self.ws.closed:
+                    return
+            except Exception:
+                pass
+
+        delay = 2
+
+        while True:
+            try:
+                self.ws = await websockets.connect(
+                    PUBLIC_WS,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=10,
+                    max_size=None,
+                )
+                print("[ATR] WebSocket Deriv conectado.")
+                return
+
+            except Exception as exc:
+                msg = str(exc)
+
+                if "429" in msg:
+                    print(
+                        f"[ATR] Deriv respondeu 429. "
+                        f"Aguardando {delay}s antes de reconectar."
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 60)
+                else:
+                    print(
+                        f"[ATR] Falha ao conectar na Deriv: {exc}. "
+                        f"Nova tentativa em {delay}s."
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 30)
+
+    async def close(self):
+        if self.ws is not None:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+
+    async def request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        async with self.lock:
+            attempts = 0
+
+            while attempts < 5:
+                attempts += 1
+
+                try:
+                    await self.connect()
+
+                    self.req_id += 1
+                    req_id = self.req_id
+
+                    data_out = dict(payload)
+                    data_out["req_id"] = req_id
+
+                    await self.ws.send(
+                        json.dumps(data_out)
+                    )
+
+                    while True:
+                        raw = await asyncio.wait_for(
+                            self.ws.recv(),
+                            timeout=30
+                        )
+
+                        data = json.loads(raw)
+
+                        if data.get("req_id") != req_id:
+                            continue
+
+                        if "error" in data:
+                            message = data["error"].get(
+                                "message",
+                                "Erro Deriv"
+                            )
+
+                            raise RuntimeError(message)
+
+                        return data
+
+                except Exception as exc:
+                    message = str(exc)
+
+                    await self.close()
+
+                    if "429" in message:
+                        delay = min(
+                            3 * attempts,
+                            20
+                        )
+
+                        print(
+                            f"[ATR] 429 em requisição. "
+                            f"Aguardando {delay}s."
+                        )
+
+                        await asyncio.sleep(delay)
+
+                    else:
+                        delay = min(
+                            2 * attempts,
+                            10
+                        )
+
+                        print(
+                            f"[ATR] Erro WebSocket: {message}. "
+                            f"Nova tentativa em {delay}s."
+                        )
+
+                        await asyncio.sleep(delay)
+
+            raise RuntimeError(
+                "Falha ao comunicar com a Deriv após várias tentativas."
+            )
+
+
+deriv = DerivPublicClient()
+
+
+# ============================================================
+# INDICADORES
+# ============================================================
+
+def ema(
+    values: List[float],
+    period: int
+) -> List[float]:
+
     if not values:
         return []
 
-    alpha = 2.0 / (period + 1.0)
+    alpha = 2.0 / (
+        period + 1.0
+    )
 
-    result = [values[0]]
+    out = [
+        values[0]
+    ]
 
     for value in values[1:]:
-        result.append(
-            alpha * value +
-            (1.0 - alpha) * result[-1]
+        out.append(
+            alpha * value
+            +
+            (
+                1.0 - alpha
+            )
+            *
+            out[-1]
         )
 
-    return result
+    return out
 
 
-async def ws_request(
-    payload: Dict[str, Any],
-    req_id: int = 1
-) -> Dict[str, Any]:
-
-    async with websockets.connect(
-        PUBLIC_WS,
-        ping_interval=20,
-        ping_timeout=20,
-        close_timeout=10
-    ) as ws:
-
-        request_data = dict(payload)
-        request_data["req_id"] = req_id
-
-        await ws.send(json.dumps(request_data))
-
-        while True:
-
-            raw = await ws.recv()
-            data = json.loads(raw)
-
-            if data.get("req_id") != req_id:
-                continue
-
-            if "error" in data:
-                raise RuntimeError(
-                    data["error"].get(
-                        "message",
-                        "Erro na API Deriv"
-                    )
-                )
-
-            return data
-
+# ============================================================
+# DADOS DE MERCADO
+# ============================================================
 
 async def active_symbols():
 
-    data = await ws_request(
+    data = await deriv.request(
         {
             "active_symbols": "brief",
             "contract_type": [
                 "CALL",
                 "PUT"
             ]
-        },
-        100
+        }
     )
 
     return data.get(
@@ -141,29 +274,29 @@ async def active_symbols():
 
 async def candles(
     symbol: str,
-    granularity: int,
-    count: int
+    count: int = 140
 ) -> List[Candle]:
 
-    data = await ws_request(
+    data = await deriv.request(
         {
             "ticks_history": symbol,
             "adjust_start_time": 1,
             "count": count,
             "end": "latest",
-            "granularity": granularity,
+            "granularity": 60,
             "style": "candles",
             "subscribe": 0
-        },
-        1000 + granularity
+        }
     )
 
-    result = []
+    result: List[Candle] = []
 
-    for candle in data.get("candles", []):
+    for candle in data.get(
+        "candles",
+        []
+    ):
 
         try:
-
             result.append(
                 Candle(
                     epoch=int(
@@ -185,7 +318,7 @@ async def candles(
             )
 
         except Exception:
-            pass
+            continue
 
     return result
 
@@ -196,7 +329,6 @@ async def latest_price(
 
     data = await candles(
         symbol,
-        60,
         2
     )
 
@@ -206,11 +338,14 @@ async def latest_price(
     return data[-1].close
 
 
+# ============================================================
+# ANÁLISE SOMENTE M1
+# ============================================================
+
 def analyze(
     symbol: str,
     name: str,
-    m1: List[Candle],
-    m15: List[Candle]
+    m1: List[Candle]
 ) -> Tuple[
     Optional[Signal],
     str,
@@ -219,19 +354,9 @@ def analyze(
 ]:
 
     if len(m1) < 110:
-
         return (
             None,
             f"M1 insuficiente ({len(m1)})",
-            0,
-            0
-        )
-
-    if len(m15) < 110:
-
-        return (
-            None,
-            f"M15 insuficiente ({len(m15)})",
             0,
             0
         )
@@ -253,13 +378,18 @@ def analyze(
 
     hlc3 = [
         (
-            x.high +
-            x.low +
+            x.high
+            +
+            x.low
+            +
             x.close
-        ) / 3.0
+        )
+        /
+        3.0
         for x in m1
     ]
 
+    # Configuração original do indicador
     e10 = ema(
         closes,
         10
@@ -293,7 +423,8 @@ def analyze(
         lows[-11:-1]
     )
 
-    ta = (
+    # Tendência micro
+    trend_up = (
         c0.close > c1.close
         and
         c0.close > e10[-1]
@@ -301,7 +432,7 @@ def analyze(
         e10[-1] > e10[-2]
     )
 
-    tb = (
+    trend_down = (
         c0.close < c1.close
         and
         c0.close < e10[-1]
@@ -309,6 +440,20 @@ def analyze(
         e10[-1] < e10[-2]
     )
 
+    # Macro tendência
+    macro_up = (
+        c0.close > e100[-1]
+        and
+        e10[-1] > e100[-1]
+    )
+
+    macro_down = (
+        c0.close < e100[-1]
+        and
+        e10[-1] < e100[-1]
+    )
+
+    # Cruzamento EMA 3 / EMA 13
     cross_up = (
         e3[-2] < e13[-2]
         and
@@ -321,6 +466,7 @@ def analyze(
         e3[-1] < e13[-1]
     )
 
+    # Engolfo
     bull_engulfing = (
         c1.close < c1.open
         and
@@ -341,6 +487,7 @@ def analyze(
         c0.close <= c1.open
     )
 
+    # Sequência de velas
     bull_sequence = (
         c0.close >
         c1.close >
@@ -355,151 +502,73 @@ def analyze(
         c3.close
     )
 
-    macro_up = (
-        c0.close > e100[-1]
-        and
-        e10[-1] > e100[-1]
-    )
-
-    macro_down = (
-        c0.close < e100[-1]
-        and
-        e10[-1] < e100[-1]
-    )
-
-    closes15 = [
-        x.close
-        for x in m15
-    ]
-
-    e10_15 = ema(
-        closes15,
-        10
-    )
-
-    e100_15 = ema(
-        closes15,
-        100
-    )
-
-    m15_up = (
-        closes15[-1] > e10_15[-1]
-        and
-        e10_15[-1] > e100_15[-1]
-        and
-        e10_15[-1] > e10_15[-2]
-    )
-
-    m15_down = (
-        closes15[-1] < e10_15[-1]
-        and
-        e10_15[-1] < e100_15[-1]
-        and
-        e10_15[-1] < e10_15[-2]
-    )
-
     call_score = 0
     put_score = 0
 
-    call_reasons = []
-    put_reasons = []
+    call_reasons: List[str] = []
+    put_reasons: List[str] = []
 
-    if ta:
-
+    if trend_up:
         call_score += 1
-
         call_reasons.append(
             "Tendência M1 alta"
         )
 
-    if tb:
-
+    if trend_down:
         put_score += 1
-
         put_reasons.append(
             "Tendência M1 baixa"
         )
 
     if macro_up:
-
         call_score += 2
-
         call_reasons.append(
-            "EMA10 > EMA100"
+            "EMA10 acima EMA100"
         )
 
     if macro_down:
-
         put_score += 2
-
         put_reasons.append(
-            "EMA10 < EMA100"
+            "EMA10 abaixo EMA100"
         )
 
     if cross_up:
-
         call_score += 1
-
         call_reasons.append(
-            "Cruzamento EMA3/13"
+            "Cruzamento EMA3/13 alta"
         )
 
     if cross_down:
-
         put_score += 1
-
         put_reasons.append(
-            "Cruzamento EMA3/13"
+            "Cruzamento EMA3/13 baixa"
         )
 
     if bull_engulfing:
-
         call_score += 2
-
         call_reasons.append(
-            "Engolfo alta"
+            "Engolfo de alta"
         )
 
     if bear_engulfing:
-
         put_score += 2
-
         put_reasons.append(
-            "Engolfo baixa"
+            "Engolfo de baixa"
         )
 
     if bull_sequence:
-
         call_score += 1
-
         call_reasons.append(
-            "Sequência alta"
+            "Sequência de alta"
         )
 
     if bear_sequence:
-
         put_score += 1
-
         put_reasons.append(
-            "Sequência baixa"
+            "Sequência de baixa"
         )
 
-    if m15_up:
-
-        call_score += 2
-
-        call_reasons.append(
-            "M15 confirma alta"
-        )
-
-    if m15_down:
-
-        put_score += 2
-
-        put_reasons.append(
-            "M15 confirma baixa"
-        )
-
+    # Suporte / resistência
     range_size = max(
         resistance - support,
         1e-12
@@ -510,19 +579,15 @@ def analyze(
     ) / range_size
 
     if position <= 0.35:
-
         call_score += 1
-
         call_reasons.append(
-            "Próximo ao suporte"
+            "Região de suporte"
         )
 
     if position >= 0.65:
-
         put_score += 1
-
         put_reasons.append(
-            "Próximo à resistência"
+            "Região de resistência"
         )
 
     if (
@@ -530,7 +595,6 @@ def analyze(
         and
         put_score == 0
     ):
-
         return (
             None,
             "score zero",
@@ -539,7 +603,6 @@ def analyze(
         )
 
     if call_score == put_score:
-
         return (
             None,
             f"empate CALL={call_score} PUT={put_score}",
@@ -548,19 +611,13 @@ def analyze(
         )
 
     if call_score > put_score:
-
         direction = "CALL"
-
         score = call_score
-
         reasons = call_reasons
 
     else:
-
         direction = "PUT"
-
         score = put_score
-
         reasons = put_reasons
 
     signal = Signal(
@@ -586,12 +643,14 @@ def analyze(
     )
 
 
+# ============================================================
+# ANALISAR UM ATIVO
+# ============================================================
+
 async def analyze_one(
-    item,
-    sem
+    item
 ):
 
-    # CORREÇÃO IMPORTANTE DA NOVA API DERIV
     symbol = (
         item.get(
             "underlying_symbol"
@@ -603,13 +662,12 @@ async def analyze_one(
     )
 
     if not symbol:
-
         return {
             "signal": None,
             "status": "sem símbolo",
             "symbol": "?",
+            "name": "?",
             "m1": 0,
-            "m15": 0,
             "call": 0,
             "put": 0
         }
@@ -630,95 +688,99 @@ async def analyze_one(
         symbol
     )
 
-    async with sem:
+    try:
 
-        try:
+        m1 = await candles(
+            symbol,
+            140
+        )
 
-            m1, m15 = await asyncio.gather(
+        (
+            signal,
+            status,
+            call_score,
+            put_score
+        ) = analyze(
+            symbol,
+            name,
+            m1
+        )
 
-                candles(
-                    symbol,
-                    60,
-                    140
-                ),
+        return {
+            "signal": signal,
+            "status": status,
+            "symbol": symbol,
+            "name": name,
+            "m1": len(m1),
+            "call": call_score,
+            "put": put_score
+        }
 
-                candles(
-                    symbol,
-                    900,
-                    120
-                )
+    except Exception as exc:
 
-            )
+        return {
+            "signal": None,
+            "status": f"erro: {exc}",
+            "symbol": symbol,
+            "name": name,
+            "m1": 0,
+            "call": 0,
+            "put": 0
+        }
 
-            (
-                signal,
-                status,
-                call_score,
-                put_score
-            ) = analyze(
-                symbol,
-                name,
-                m1,
-                m15
-            )
 
-            return {
-                "signal": signal,
-                "status": status,
-                "symbol": symbol,
-                "name": name,
-                "m1": len(m1),
-                "m15": len(m15),
-                "call": call_score,
-                "put": put_score
-            }
-
-        except Exception as exc:
-
-            return {
-                "signal": None,
-                "status": (
-                    f"erro: {exc}"
-                ),
-                "symbol": symbol,
-                "name": name,
-                "m1": 0,
-                "m15": 0,
-                "call": 0,
-                "put": 0
-            }
-
+# ============================================================
+# SCANNER
+# Sem 71 conexões simultâneas
+# ============================================================
 
 async def scan_once():
 
     async with scan_lock:
 
         state["status"] = (
-            "Analisando mercados..."
+            "Analisando mercados M1..."
         )
 
         symbols = await active_symbols()
 
-        semaphore = asyncio.Semaphore(
-            8
-        )
+        results = []
 
-        results = await asyncio.gather(
-            *[
-                analyze_one(
-                    item,
-                    semaphore
+        for index, item in enumerate(
+            symbols,
+            start=1
+        ):
+
+            if not state["running"] and state["last_scan"] is not None:
+                break
+
+            result = await analyze_one(
+                item
+            )
+
+            results.append(
+                result
+            )
+
+            if index % 10 == 0:
+                print(
+                    f"[ATR] Scanner M1: "
+                    f"{index}/{len(symbols)} ativos processados."
                 )
-                for item
-                in symbols
-            ]
-        )
+
+            await asyncio.sleep(
+                max(
+                    config.intervalo_entre_ativos_ms,
+                    0
+                )
+                /
+                1000.0
+            )
 
         signals = [
             x["signal"]
             for x in results
-            if x["signal"]
-            is not None
+            if x["signal"] is not None
         ]
 
         signals.sort(
@@ -728,17 +790,18 @@ async def scan_once():
 
         state["signals"] = [
             asdict(x)
-            for x
-            in signals[:25]
+            for x in signals[:25]
         ]
 
         state["last_scan"] = int(
             time.time()
         )
 
-        state["status"] = (
-            f"{len(symbols)} ativos analisados"
-        )
+        valid = [
+            x
+            for x in results
+            if x["m1"] >= 110
+        ]
 
         api_errors = [
             x
@@ -748,7 +811,7 @@ async def scan_once():
             )
         ]
 
-        m1_short = [
+        short = [
             x
             for x in results
             if x["status"].startswith(
@@ -756,19 +819,12 @@ async def scan_once():
             )
         ]
 
-        m15_short = [
-            x
-            for x in results
-            if x["status"].startswith(
-                "M15 insuficiente"
-            )
-        ]
-
-        zero_score = [
+        zero = [
             x
             for x in results
             if x["status"]
-            == "score zero"
+            ==
+            "score zero"
         ]
 
         ties = [
@@ -779,19 +835,10 @@ async def scan_once():
             )
         ]
 
-        valid = [
-            x
-            for x in results
-            if
-            x["m1"] >= 110
-            and
-            x["m15"] >= 110
-        ]
-
         qualified = [
-            signal
-            for signal in signals
-            if signal.qualified
+            s
+            for s in signals
+            if s.qualified
         ]
 
         max_score = (
@@ -801,9 +848,11 @@ async def scan_once():
         )
 
         state["diagnostics"] = {
-
             "symbols_total":
             len(symbols),
+
+            "processed":
+            len(results),
 
             "valid_data":
             len(valid),
@@ -812,13 +861,10 @@ async def scan_once():
             len(api_errors),
 
             "m1_insufficient":
-            len(m1_short),
-
-            "m15_insufficient":
-            len(m15_short),
+            len(short),
 
             "zero_score":
-            len(zero_score),
+            len(zero),
 
             "ties":
             len(ties),
@@ -833,25 +879,32 @@ async def scan_once():
             max_score,
 
             "best_name":
-            signals[0].name
-            if signals
-            else "-",
+            (
+                signals[0].name
+                if signals
+                else "-"
+            ),
 
             "best_direction":
-            signals[0].direction
-            if signals
-            else "-"
-
+            (
+                signals[0].direction
+                if signals
+                else "-"
+            )
         }
 
+        state["status"] = (
+            f"{len(results)} ativos M1 analisados"
+        )
+
         print(
-            "[ATR] DIAGNÓSTICO | "
+            "[ATR] DIAGNÓSTICO M1 | "
             f"ativos={len(symbols)} | "
+            f"processados={len(results)} | "
             f"dados_validos={len(valid)} | "
             f"erros_api={len(api_errors)} | "
-            f"m1_curto={len(m1_short)} | "
-            f"m15_curto={len(m15_short)} | "
-            f"score_zero={len(zero_score)} | "
+            f"m1_curto={len(short)} | "
+            f"score_zero={len(zero)} | "
             f"empates={len(ties)} | "
             f"candidatos={len(signals)} | "
             f"qualificados={len(qualified)} | "
@@ -859,11 +912,10 @@ async def scan_once():
         )
 
         if signals:
-
             best = signals[0]
 
             print(
-                "[ATR] MELHOR | "
+                "[ATR] MELHOR M1 | "
                 f"{best.name} | "
                 f"{best.direction} | "
                 f"score={best.score} | "
@@ -872,20 +924,22 @@ async def scan_once():
 
         for item in (
             api_errors +
-            m1_short +
-            m15_short
+            short
         )[:5]:
 
             print(
                 "[ATR] AMOSTRA_FALHA | "
                 f"{item['symbol']} | "
                 f"{item['status']} | "
-                f"M1={item['m1']} | "
-                f"M15={item['m15']}"
+                f"M1={item['m1']}"
             )
 
         return state["signals"]
 
+
+# ============================================================
+# GESTÃO DE RISCO
+# ============================================================
 
 def risk_ok():
 
@@ -895,7 +949,8 @@ def risk_ok():
 
     pnl = (
         (
-            state["balance"] -
+            state["balance"]
+            -
             start
         )
         /
@@ -907,19 +962,15 @@ def risk_ok():
     )
 
     if pnl >= config.stop_gain:
-
         state["status"] = (
             "Stop Gain atingido"
         )
-
         return False
 
     if pnl <= -config.stop_loss:
-
         state["status"] = (
             "Stop Loss atingido"
         )
-
         return False
 
     if (
@@ -927,11 +978,9 @@ def risk_ok():
         >=
         config.max_entradas
     ):
-
         state["status"] = (
             "Limite de entradas atingido"
         )
-
         return False
 
     return True
@@ -952,6 +1001,10 @@ def best_qualified_signal():
     )
 
 
+# ============================================================
+# PAPER TRADING
+# ============================================================
+
 def open_paper_trade(
     signal
 ):
@@ -960,11 +1013,9 @@ def open_paper_trade(
         state["open_trade"]
         is not None
     ):
-
         return None
 
     if not risk_ok():
-
         return None
 
     stake = round(
@@ -972,12 +1023,11 @@ def open_paper_trade(
         *
         config.percentual_entrada
         /
-        100,
+        100.0,
         2
     )
 
     if stake <= 0:
-
         return None
 
     now = int(
@@ -985,7 +1035,6 @@ def open_paper_trade(
     )
 
     trade = {
-
         "time":
         now,
 
@@ -1010,7 +1059,8 @@ def open_paper_trade(
         ),
 
         "expires_at":
-        now +
+        now
+        +
         int(
             config.duracao_minutos
             *
@@ -1022,29 +1072,20 @@ def open_paper_trade(
 
         "qualified":
         True
-
     }
 
-    state[
-        "open_trade"
-    ] = trade
+    state["open_trade"] = trade
 
-    state[
-        "entries"
-    ] += 1
+    state["entries"] += 1
 
-    state[
-        "history"
-    ].insert(
+    state["history"].insert(
         0,
         dict(trade)
     )
 
-    state[
-        "history"
-    ] = state[
-        "history"
-    ][:50]
+    state["history"] = (
+        state["history"][:50]
+    )
 
     state["status"] = (
         f"Entrada DEMO: "
@@ -1053,7 +1094,7 @@ def open_paper_trade(
     )
 
     print(
-        "[ATR] ENTRADA DEMO | "
+        "[ATR] ENTRADA DEMO M1 | "
         f"{signal['name']} | "
         f"{signal['direction']} | "
         f"score={signal['score']} | "
@@ -1070,7 +1111,6 @@ async def settle_open_trade():
     )
 
     if not trade:
-
         return
 
     now = int(
@@ -1099,12 +1139,10 @@ async def settle_open_trade():
     )
 
     if exit_price is None:
-
         state["status"] = (
             "Aguardando preço "
             "para encerrar DEMO"
         )
-
         return
 
     entry_price = float(
@@ -1127,37 +1165,27 @@ async def settle_open_trade():
     elif direction == "CALL":
 
         if exit_price > entry_price:
-
             result = "WIN"
-
             pnl = (
                 stake
                 *
                 config.payout_demo
             )
-
         else:
-
             result = "LOSS"
-
             pnl = -stake
 
     else:
 
         if exit_price < entry_price:
-
             result = "WIN"
-
             pnl = (
                 stake
                 *
                 config.payout_demo
             )
-
         else:
-
             result = "LOSS"
-
             pnl = -stake
 
     state["balance"] = round(
@@ -1193,23 +1221,16 @@ async def settle_open_trade():
     )
 
     if state["history"]:
-
-        state[
-            "history"
-        ][0] = closed
-
+        state["history"][0] = (
+            closed
+        )
     else:
-
-        state[
-            "history"
-        ].insert(
+        state["history"].insert(
             0,
             closed
         )
 
-    state[
-        "open_trade"
-    ] = None
+    state["open_trade"] = None
 
     state["status"] = (
         f"{result} • "
@@ -1218,7 +1239,7 @@ async def settle_open_trade():
     )
 
     print(
-        "[ATR] RESULTADO | "
+        "[ATR] RESULTADO M1 | "
         f"{trade['name']} | "
         f"{result} | "
         f"entrada={entry_price} | "
@@ -1228,10 +1249,14 @@ async def settle_open_trade():
     )
 
 
+# ============================================================
+# ROBÔ AUTOMÁTICO
+# ============================================================
+
 async def robot_loop():
 
     print(
-        "[ATR] Robô automático DEMO iniciado."
+        "[ATR] Robô automático M1 DEMO iniciado."
     )
 
     try:
@@ -1239,17 +1264,11 @@ async def robot_loop():
         while state["running"]:
 
             if not risk_ok():
-
-                state[
-                    "running"
-                ] = False
-
+                state["running"] = False
                 break
 
             if (
-                state[
-                    "open_trade"
-                ]
+                state["open_trade"]
                 is not None
             ):
 
@@ -1264,6 +1283,9 @@ async def robot_loop():
             try:
 
                 await scan_once()
+
+                if not state["running"]:
+                    break
 
                 best = (
                     best_qualified_signal()
@@ -1305,6 +1327,11 @@ async def robot_loop():
                     f"{exc}"
                 )
 
+                if "429" in str(exc):
+                    await asyncio.sleep(
+                        30
+                    )
+
             if (
                 state["running"]
                 and
@@ -1312,6 +1339,7 @@ async def robot_loop():
                 is None
             ):
 
+                # Próxima análise alinhada ao minuto seguinte.
                 wait = max(
                     60 -
                     (
@@ -1333,7 +1361,6 @@ async def robot_loop():
                 )
 
     except asyncio.CancelledError:
-
         raise
 
     finally:
@@ -1343,9 +1370,13 @@ async def robot_loop():
         ]:
 
             print(
-                "[ATR] Robô automático DEMO parado."
+                "[ATR] Robô automático M1 DEMO parado."
             )
 
+
+# ============================================================
+# ROTAS
+# ============================================================
 
 @app.get("/")
 async def home():
@@ -1380,8 +1411,10 @@ async def get_status():
 
     return {
         **state,
+
         "config":
         config.model_dump(),
+
         "pnl_percent":
         round(
             pnl,
@@ -1483,7 +1516,7 @@ async def start():
     state[
         "status"
     ] = (
-        "ATR automático iniciado"
+        "ATR M1 automático iniciado"
     )
 
     if (
@@ -1501,7 +1534,7 @@ async def start():
     return {
         "ok": True,
         "message":
-        "ATR automático DEMO iniciado."
+        "ATR automático M1 DEMO iniciado."
     }
 
 
@@ -1594,6 +1627,11 @@ async def paper_entry():
         "entry":
         entry
     }
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await deriv.close()
 
 
 app.mount(
