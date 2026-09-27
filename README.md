@@ -1,17 +1,11 @@
-Operação Alvo Certo (ATR) — Mercado Bitcoin FINAL
-Arquivos prontos para GitHub/Render.
-Variáveis do Render
-MB_API_ID
-MB_API_SECRET
-MB_ACCOUNT_ID (opcional)
-Build
-pip install -r requirements.txt
-Start
-uvicorn main:app --host 0.0.0.0 --port $PORT
-Estratégia preservada
-M1 + confirmação M15; EMA 10/100; cruzamento EMA 3/13; engolfo; sequência de candles; suporte/resistência dos últimos 10 candles; tendência macro; score mínimo 7; resultado COMPRA / VENDA / AGUARDAR.
-Operação
-Compra real somente com sinal COMPRA válido.
-Venda automática após 60 segundos apenas da quantidade comprada pelo próprio ATR.
-Se o valor calculado por % estiver abaixo do min-cost do ativo, a ordem é bloqueada.
-VENDA analítica não abre short nem vende saldo antigo.
+Operação Alvo Certo (ATR) — aprimorado
+Mantém a interface e a estratégia anterior e acrescenta:
+Take Profit e Stop Loss por operação
+tempo máximo configurável
+seleção M1/M5, mantendo confirmação M15
+resultado líquido e taxas registradas por ordem
+confirmação opcional por notícias (GDELT), usada apenas como filtro de conflito
+correção do cálculo do Stop Gain/Stop Loss da sessão para usar P/L realizado
+fechamento vende somente a quantidade comprada pelo ATR
+Variáveis Render: MB_API_ID, MB_API_SECRET e opcional MB_ACCOUNT_ID. Build: pip install -r requirements.txt Start: uvicorn main:app --host 0.0.0.0 --port $PORT
+IMPORTANTE: ordens são reais. Teste primeiro scanner, saldo e controles. O fechamento por tempo é solicitado ao atingir o tempo configurado; execução real pode ocorrer alguns segundos depois por rede/API/mercado.
