@@ -1,11 +1,17 @@
-const brl=v=>new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(v||0);
-const api=async(url,opts={})=>{const r=await fetch(url,{headers:{'Content-Type':'application/json'},...opts});return await r.json()};
-async function refresh(){const s=await api('/api/status');balance.textContent=s.mb_connected?brl(s.balance):'API desconectada';pnl.textContent=`${Number(s.pnl_percent).toFixed(2)}%`;entries.textContent=s.entries;status.textContent=s.status;robotBadge.textContent=s.running?'REAL ATIVO':'PARADO';robotBadge.className='badge '+(s.running?'on':'off');renderSignals(s.signals||[]);renderHistory(s.history||[]);if(s.last_scan)lastScan.textContent='Última análise: '+new Date(s.last_scan*1000).toLocaleTimeString('pt-BR')}
-function renderSignals(items){signals.innerHTML=!items.length?'<div class="empty">Nenhum sinal atingiu o score mínimo.</div>':items.map((x,i)=>`<div class="signal"><div><div class="symbol">${i===0?'🎯 ':''}${x.name} <span class="${x.direction==='COMPRA'?'call':'put'}">${x.direction==='COMPRA'?'▲ COMPRA':'▼ VENDA'}</span></div><div class="meta">${x.symbol} • ${brl(x.price)} • suporte ${brl(x.support)} • resistência ${brl(x.resistance)}</div><div class="reasons">${x.reasons.join(' • ')}</div></div><div class="score">${x.score}/12</div></div>`).join('')}
-function renderHistory(items){history.innerHTML=!items.length?'<div class="empty">Nenhuma ordem enviada pelo ATR nesta sessão.</div>':items.map(x=>`<div class="history-row"><strong>${x.name}</strong><span class="call">${x.direction}</span><span>Score ${x.score}</span><span>${brl(x.stake)}</span><span>${x.result}</span></div>`).join('')}
-async function scan(){status.textContent='Analisando...';await api('/api/scan',{method:'POST'});refresh()}
-async function startRobot(){await api('/api/start',{method:'POST'});refresh()}
-async function stopRobot(){await api('/api/stop',{method:'POST'});refresh()}
-async function realEntry(){if(!confirm('ATENÇÃO: isto enviará uma ordem REAL no Mercado Bitcoin usando dinheiro da sua conta. Confirmar?'))return;const r=await api('/api/real-entry',{method:'POST'});if(!r.ok)alert(r.message);else alert('Ordem real enviada.');refresh()}
-async function saveConfig(e){e.preventDefault();const body={percentual_entrada:+percent.value,stop_gain:+sg.value,stop_loss:+sl.value,max_entradas:+maxe.value,min_score:+score.value,filtro_volatilidade:vol.value==='true',max_movimento_m1_pct:+maxvol.value,auto_trade:autoTrade.value==='true'};await api('/api/config',{method:'POST',body:JSON.stringify(body)});alert('Configurações salvas.');refresh()}
-if('serviceWorker'in navigator)navigator.serviceWorker.register('/static/sw.js');refresh();setInterval(refresh,5000);
+async function req(url,opt={}){const r=await fetch(url,opt);return await r.json()}
+function money(v){return v==null?"--":Number(v).toLocaleString("pt-BR",{style:"currency",currency:"BRL"})}
+function render(s){
+ document.querySelector("#balance").textContent=money(s.balance);
+ document.querySelector("#pnl").textContent=Number(s.pnl_percent||0).toFixed(2)+"%";
+ document.querySelector("#entries").textContent=s.entries||0;
+ document.querySelector("#status").textContent=s.status||"--";
+ document.querySelector("#symbols").textContent=(s.symbols||[]).join(" • ")||"--";
+ const el=document.querySelector("#signals");
+ if(!s.signals?.length){el.innerHTML="<p>Nenhum sinal atingiu o score mínimo.</p>";return}
+ el.innerHTML=s.signals.map(x=>`<article><h3>${x.symbol} — ${x.direction}</h3><b>Score ${x.score}</b><p>Preço: ${x.price}</p><p>${(x.reasons||[]).join(" • ")}</p></article>`).join("");
+}
+async function status(){try{render(await req("/api/status"))}catch(e){}}
+document.querySelector("#scan").onclick=async()=>{document.querySelector("#status").textContent="Analisando...";await req("/api/scan",{method:"POST"});status()}
+document.querySelector("#start").onclick=async()=>{await req("/api/start",{method:"POST"});status()}
+document.querySelector("#stop").onclick=async()=>{await req("/api/stop",{method:"POST"});status()}
+status();setInterval(status,5000);
