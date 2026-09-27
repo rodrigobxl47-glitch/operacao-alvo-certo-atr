@@ -1,8 +1,1 @@
-ATR Mercado Bitcoin v5
-Mantém a estratégia de análise original (EMA10/100, EMA3/13, engolfo, sequência, suporte/resistência e confirmação M15) adaptada ao Mercado Bitcoin.
-Variáveis Render:
-MB_API_ID
-MB_API_SECRET
-MB_ACCOUNT_ID (opcional)
-Start: uvicorn main:app --host 0.0.0.0 --port $PORT
-IMPORTANTE: esta v5 mantém ordens reais bloqueadas para validar primeiro os candles e sinais.
+*{box-sizing:border-box}body{margin:0;background:#0b1019;color:#f7f8fb;font-family:Arial,sans-serif}main{max-width:820px;margin:auto;padding:28px 18px 60px}h1{font-size:29px;margin:0 0 5px}.sub,.muted{color:#9da9bb}.cards{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:28px 0}.cards div,.panel{background:#111824;border:1px solid #283449;border-radius:22px;padding:22px}.cards span{display:block;color:#9da9bb;margin-bottom:10px}.cards b{font-size:27px}.buttons{display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px}.buttons button,.panel button{border:0;border-radius:16px;padding:17px;font-weight:700;font-size:15px;cursor:pointer}.gold{background:#ffd452}.buy{grid-column:1/-1;background:#f5f6f8;color:#121722}.buy:disabled{opacity:.4}.panel{margin-top:24px}.opp{padding:14px 0;border-bottom:1px solid #283449}.tag{display:inline-block;padding:5px 9px;border-radius:9px;background:#202b3c;font-weight:700}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.grid label{color:#aab4c4}.grid input{width:100%;margin-top:6px;background:#0b1019;border:1px solid #334158;border-radius:10px;padding:11px;color:white}.check{display:block;margin:18px 0}.panel button{background:#ffd452}.danger{color:#ff8c8c}#toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:#202b3c;padding:12px 18px;border-radius:12px;display:none;max-width:90%}@media(max-width:600px){.cards b{font-size:22px}.buttons{grid-template-columns:1fr 1fr}.gold{grid-column:1/-1}.grid{grid-template-columns:1fr}}
