@@ -1,1 +1,8 @@
-*{box-sizing:border-box}body{margin:0;background:#0b1019;color:#f5f7fb;font-family:Arial,sans-serif}main{max-width:850px;margin:auto;padding:28px 18px}h1{margin-bottom:4px}.sub{color:#9ca8ba}.cards{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:28px 0}.cards div,.panel{border:1px solid #273246;background:#111824;border-radius:22px;padding:22px}.cards span{display:block;color:#9ca8ba;margin-bottom:12px}.cards b{font-size:28px}.buttons{display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px}.buttons button{border:0;border-radius:18px;padding:18px;font-weight:bold;font-size:16px;cursor:pointer}.buttons button:first-child{background:#ffd354}.panel{margin-top:24px}.panel article{padding:14px 0;border-bottom:1px solid #273246}.warn{padding:16px;border-radius:14px;background:#1b2230;color:#ffd354}@media(max-width:600px){.buttons{grid-template-columns:1fr 1fr}.buttons button:first-child{grid-column:1/-1}.cards b{font-size:22px}}
+ATR Mercado Bitcoin v5
+Mantém a estratégia de análise original (EMA10/100, EMA3/13, engolfo, sequência, suporte/resistência e confirmação M15) adaptada ao Mercado Bitcoin.
+Variáveis Render:
+MB_API_ID
+MB_API_SECRET
+MB_ACCOUNT_ID (opcional)
+Start: uvicorn main:app --host 0.0.0.0 --port $PORT
+IMPORTANTE: esta v5 mantém ordens reais bloqueadas para validar primeiro os candles e sinais.
