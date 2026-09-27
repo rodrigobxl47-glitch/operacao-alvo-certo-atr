@@ -49,12 +49,31 @@ async def mb_post(path, payload):
     async with httpx.AsyncClient(timeout=20) as c:
         r=await c.post(f'{MB_BASE}{path}',json=payload,headers={'Authorization':f'Bearer {await token()}'}); r.raise_for_status(); return r.json()
 
+async def account_info():
+    # Se o ID da conta foi configurado manualmente, usa-o diretamente.
+    if MB_ACCOUNT_ID:
+        return {'id': MB_ACCOUNT_ID, 'type': 'configured', 'name': 'configured'}
+
+    data = await mb_get('/accounts', private=True)
+    # A API pode devolver a lista diretamente ou dentro de uma chave.
+    if isinstance(data, dict):
+        accounts = data.get('accounts') or data.get('data') or data.get('items') or []
+    else:
+        accounts = data
+    if not isinstance(accounts, list) or not accounts:
+        raise RuntimeError('Nenhuma conta foi retornada por /accounts.')
+
+    # Não exige type=live. Usa a primeira conta válida que possua ID.
+    valid = [a for a in accounts if isinstance(a, dict) and a.get('id')]
+    if not valid:
+        raise RuntimeError('A API retornou conta(s), mas nenhuma possui campo id.')
+
+    # Se houver uma conta marcada como live/real, prefere-a; caso contrário, usa a primeira válida.
+    chosen = next((a for a in valid if str(a.get('type','')).lower() in ('live','real')), valid[0])
+    return chosen
+
 async def account_id():
-    if MB_ACCOUNT_ID:return MB_ACCOUNT_ID
-    a=await mb_get('/accounts',private=True)
-    live=next((x for x in a if x.get('type')=='live'),None)
-    if not live: raise RuntimeError('Conta REAL (live) não encontrada.')
-    return live['id']
+    return (await account_info())['id']
 
 async def market_prices():
     rows=await mb_get('/tickers',{'symbols':','.join(SYMBOLS)})
@@ -65,7 +84,7 @@ async def refresh_balance():
     try:
         # 1) autentica e localiza a conta REAL
         await token(); diag['auth']=True
-        aid=await account_id(); diag['account']=True; diag['account_type']='live'
+        acct=await account_info(); aid=acct['id']; diag['account']=True; diag['account_type']=str(acct.get('type') or 'não informado')
 
         # 2) saldo vem primeiro. Falha no ticker nao pode zerar a banca em BRL.
         bals=await mb_get(f'/accounts/{aid}/balances',private=True); diag['balances']=True
