@@ -23,7 +23,7 @@ class Config(BaseModel):
     auto_trade: bool=False
 
 config=Config()
-state={'running':False,'balance':0.0,'available_brl':0.0,'start_balance':None,'mb_connected':False,'mb_error':None,'entries':0,'signals':[],'history':[],'last_scan':None,'last_balance_update':None,'status':'Parado','assets':{},'prices':{},'market_blocked':False,'block_reason':None}
+state={'running':False,'balance':None,'available_brl':None,'start_balance':None,'mb_connected':False,'mb_error':None,'entries':0,'signals':[],'history':[],'last_scan':None,'last_balance_update':None,'status':'Parado','assets':{},'prices':{},'market_blocked':False,'block_reason':None,'mb_diag':{'credentials_configured':bool(MB_API_ID and MB_API_SECRET),'auth':False,'account':False,'balances':False,'prices':False,'account_type':None,'brl_total':None,'brl_available':None,'last_error':None}}
 
 @dataclass
 class Candle: epoch:int; open:float; high:float; low:float; close:float
@@ -61,20 +61,43 @@ async def market_prices():
     return {x['pair']:float(x['last']) for x in rows}
 
 async def refresh_balance():
+    diag={'credentials_configured':bool(MB_API_ID and MB_API_SECRET),'auth':False,'account':False,'balances':False,'prices':False,'account_type':None,'brl_total':None,'brl_available':None,'last_error':None}
     try:
-        aid=await account_id(); bals=await mb_get(f'/accounts/{aid}/balances',private=True); prices=await market_prices(); state['prices']=prices
-        assets={}; patrimonio=0.0
+        # 1) autentica e localiza a conta REAL
+        await token(); diag['auth']=True
+        aid=await account_id(); diag['account']=True; diag['account_type']='live'
+
+        # 2) saldo vem primeiro. Falha no ticker nao pode zerar a banca em BRL.
+        bals=await mb_get(f'/accounts/{aid}/balances',private=True); diag['balances']=True
+        assets={}; brl_total=0.0; brl_available=0.0
         for b in bals:
             sym=str(b.get('symbol','')).upper(); total=float(b.get('total',0) or 0); avail=float(b.get('available',0) or 0)
-            if total<=0: continue
-            assets[sym]={'total':total,'available':avail}
-            if sym=='BRL': patrimonio+=total; state['available_brl']=round(avail,2)
-            elif f'{sym}-BRL' in prices: patrimonio+=total*prices[f'{sym}-BRL']
-        state['assets']=assets; state['balance']=round(patrimonio,2)
-        if state['start_balance'] is None: state['start_balance']=state['balance']
-        state['mb_connected']=True; state['mb_error']=None; state['last_balance_update']=int(time.time()); return True
+            if total>0 or avail>0: assets[sym]={'total':total,'available':avail}
+            if sym=='BRL': brl_total=total; brl_available=avail
+        diag['brl_total']=round(brl_total,2); diag['brl_available']=round(brl_available,2)
+        state['assets']=assets; state['available_brl']=round(brl_available,2)
+        state['balance']=round(brl_total,2)
+
+        # 3) tenta somar BTC/ETH ao patrimonio; se cotacao falhar, preserva o BRL real.
+        try:
+            prices=await market_prices(); state['prices']=prices; diag['prices']=True
+            patrimonio=brl_total
+            for sym,a in assets.items():
+                pair=f'{sym}-BRL'
+                if sym!='BRL' and pair in prices: patrimonio += a['total']*prices[pair]
+            state['balance']=round(patrimonio,2)
+        except Exception as pe:
+            diag['last_error']=f'Cotacoes: {type(pe).__name__}: {str(pe)[:160]}'
+
+        if state['start_balance'] is None and state['balance'] is not None: state['start_balance']=state['balance']
+        state['mb_connected']=True; state['mb_error']=diag['last_error']; state['last_balance_update']=int(time.time()); state['mb_diag']=diag
+        print(f"MB saldo OK | BRL total={diag['brl_total']} disponivel={diag['brl_available']} | precos={diag['prices']}", flush=True)
+        return True
     except Exception as e:
-        state['mb_connected']=False; state['mb_error']=str(e)[:240]; return False
+        msg=f'{type(e).__name__}: {str(e)[:220]}'
+        diag['last_error']=msg; state['mb_diag']=diag; state['mb_connected']=False; state['mb_error']=msg; state['balance']=None; state['available_brl']=None
+        print(f'MB saldo ERRO | {msg}', flush=True)
+        return False
 
 async def balance_loop():
     while True: await refresh_balance(); await asyncio.sleep(15)
@@ -133,7 +156,7 @@ async def scan_once():
 
 def risk_ok():
     if not state['mb_connected']:return False,'API Mercado Bitcoin desconectada.'
-    start=state['start_balance'] or state['balance']; pnl=((state['balance']-start)/start*100) if start else 0
+    bal=state['balance']; start=state['start_balance']; pnl=((bal-start)/start*100) if (bal is not None and start not in (None,0)) else 0
     if pnl>=config.stop_gain:return False,'Stop Gain da sessão atingido.'
     if pnl<=-config.stop_loss:return False,'Stop Loss da sessão atingido.'
     if state['entries']>=config.max_entradas:return False,'Limite de entradas atingido.'
@@ -142,7 +165,9 @@ def risk_ok():
 async def real_buy(signal):
     ok,msg=risk_ok()
     if not ok:return {'ok':False,'message':msg}
-    stake=round(state['available_brl']*config.percentual_entrada/100,2)
+    avail=state['available_brl'];
+    if avail is None:return {'ok':False,'message':'Saldo indisponível. Ordem REAL bloqueada.'}
+    stake=round(avail*config.percentual_entrada/100,2)
     if stake<=0:return {'ok':False,'message':'Saldo BRL disponível insuficiente.'}
     aid=await account_id(); ext=f'ATR-{int(time.time())}-{uuid.uuid4().hex[:8]}'
     payload={'type':'market','side':'buy','cost':stake,'async':False,'externalId':ext}
@@ -164,7 +189,7 @@ async def robot_loop():
 async def home():return FileResponse('static/index.html')
 @app.get('/api/status')
 async def status():
-    start=state['start_balance'] or state['balance']; pnl=((state['balance']-start)/start*100) if start else 0
+    bal=state['balance']; start=state['start_balance']; pnl=((bal-start)/start*100) if (bal is not None and start not in (None,0)) else 0
     return {**state,'config':config.model_dump(),'pnl_percent':round(pnl,2)}
 @app.post('/api/mb-refresh')
 async def mbrefresh():return {'ok':await refresh_balance(),'balance':state['balance'],'error':state['mb_error']}
