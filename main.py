@@ -31,6 +31,10 @@ class Config(BaseModel):
     max_movimento_pct: float=1.0
     news_filter: bool=True
     news_confirm_only: bool=True
+    news_exit_enabled: bool=True
+    news_exit_min_strength: int=3
+    news_exit_confirm_pct: float=0.15
+    news_check_seconds: int=60
 
 config=Config()
 state={"running":False,"balance":None,"available_brl":None,"start_balance":None,
@@ -235,10 +239,39 @@ def analyze(symbol,name,primary,m15,news):
     if lateral_sell: ss+=3;sr.append("Lateral: topo da faixa + gatilho")
     trend_buy=regime=="ALTA" and (abc_up or macro_up) and (pullback_up or bull_eng or reject_up or bull_seq)
     trend_sell=regime=="BAIXA" and (abc_dn or macro_dn) and (pullback_dn or bear_eng or reject_dn or bear_seq)
-    technical="COMPRA" if bs>=config.min_score and bs>ss and (trend_buy or lateral_buy) else "VENDA" if ss>=config.min_score and ss>bs and (trend_sell or lateral_sell) else "AGUARDAR"
-    move=abs((c0.close-c1.close)/c1.close*100) if c1.close else 0; volatile=move>config.max_movimento_pct
+    # Não compra uma alta já encostada na resistência: exige espaço mínimo até o topo da faixa.
+    room_up=((resistance-c0.close)/c0.close*100) if c0.close else 0
+    room_down=((c0.close-support)/c0.close*100) if c0.close else 0
+    min_room=max(0.20, config.take_profit_operacao*0.50)
+    buy_context=(trend_buy or lateral_buy) and (lateral_buy or room_up>=min_room or pullback_up)
+    sell_context=(trend_sell or lateral_sell) and (lateral_sell or room_down>=min_room or pullback_dn)
+    if not buy_context and bs>=config.min_score: br.append(f"Sem espaço suficiente até resistência ({room_up:.2f}%)")
+    if not sell_context and ss>=config.min_score: sr.append(f"Sem espaço suficiente até suporte ({room_down:.2f}%)")
+    technical="COMPRA" if bs>=config.min_score and bs>ss and buy_context else "VENDA" if ss>=config.min_score and ss>bs and sell_context else "AGUARDAR"
+    move_signed=((c0.close-c1.close)/c1.close*100) if c1.close else 0
+    move=abs(move_signed)
+    volatile=move>config.max_movimento_pct
+
+    # Volatilidade adaptativa:
+    # não bloqueia automaticamente um impulso forte quando TODA a estrutura confirma.
+    strong_buy_impulse=(
+        volatile and move_signed>0 and regime=="ALTA" and m15_up and
+        (abc_up or pullback_up) and (bull_eng or bull_seq or pullback_up) and
+        bs>=max(config.min_score,8) and bs>=ss+3 and buy_context
+    )
+    strong_sell_impulse=(
+        volatile and move_signed<0 and regime=="BAIXA" and m15_dn and
+        (abc_dn or pullback_dn) and (bear_eng or bear_seq or pullback_dn) and
+        ss>=max(config.min_score,8) and ss>=bs+3 and sell_context
+    )
+    volatility_ok=(not volatile) or strong_buy_impulse or strong_sell_impulse
+    if strong_buy_impulse: br.append(f"Impulso forte validado ({move:.2f}%): tendência + M15 + estrutura/gatilho")
+    if strong_sell_impulse: sr.append(f"Impulso forte de baixa validado ({move:.2f}%): tendência + M15 + estrutura/gatilho")
+
     nd=news["direction"]
-    if volatile: result="AGUARDAR"; reasons=[f"Volatilidade {config.timeframe.upper()} {move:.2f}% acima do limite"]
+    if not volatility_ok:
+        result="AGUARDAR"
+        reasons=[f"Volatilidade {config.timeframe.upper()} {move:.2f}%: movimento esticado/sem confirmação suficiente"]
     elif technical=="COMPRA" and config.news_filter and config.news_confirm_only and nd=="BAIXA": result="AGUARDAR";reasons=br+["Notícia conflita com alta"]
     elif technical=="VENDA" and config.news_filter and config.news_confirm_only and nd=="ALTA": result="AGUARDAR";reasons=sr+["Notícia conflita com baixa"]
     else:
@@ -304,6 +337,8 @@ async def close_position(reason):
     state["open_trade"]=None; state["status"]=f"Operação fechada • {reason}"; await refresh_balance()
 
 async def monitor_trade():
+    last_news_check=0
+    adverse_hits=0
     while state.get("open_trade"):
         tr=state["open_trade"]
         try:
@@ -311,14 +346,38 @@ async def monitor_trade():
             pct=(px-tr["entry_price"])/tr["entry_price"]*100 if tr["entry_price"] else 0
             tr["current_pnl_percent"]=pct
             reason=None
-            if config.take_profit_operacao>0 and pct>=config.take_profit_operacao:reason="TAKE PROFIT"
-            elif config.stop_loss_operacao>0 and pct<=-config.stop_loss_operacao:reason="STOP LOSS"
-            elif time.time()>=tr["expires_at"]:reason="TEMPO MÁXIMO"
+
+            # Proteções duras sempre têm prioridade.
+            if config.take_profit_operacao>0 and pct>=config.take_profit_operacao:
+                reason="TAKE PROFIT"
+            elif config.stop_loss_operacao>0 and pct<=-config.stop_loss_operacao:
+                reason="STOP LOSS"
+            elif time.time()>=tr["expires_at"]:
+                reason="TEMPO MÁXIMO"
+
+            # Proteção por notícia: não sai apenas por manchete/tom.
+            # Exige notícia contrária + força mínima + confirmação do preço em queda.
+            if not reason and config.news_filter and config.news_exit_enabled and time.time()-last_news_check>=config.news_check_seconds:
+                ns=await news_signal(tr["symbol"])
+                state["news"][tr["symbol"]]=ns
+                tr["news_direction"]=ns["direction"]; tr["news_strength"]=ns["strength"]
+                last_news_check=time.time()
+                adverse=(tr["direction"]=="COMPRA" and ns["direction"]=="BAIXA" and ns["strength"]>=config.news_exit_min_strength)
+                price_confirms=(pct<=-abs(config.news_exit_confirm_pct))
+                if adverse and price_confirms:
+                    adverse_hits+=1
+                else:
+                    adverse_hits=0
+                tr["news_adverse_hits"]=adverse_hits
+                if adverse_hits>=1:
+                    reason="REVERSÃO: NOTÍCIA + PREÇO"
+
             if reason:
                 async with _trade_lock:
-                    if state.get("open_trade"):await close_position(reason)
+                    if state.get("open_trade"): await close_position(reason)
                 return
-        except Exception as e:state["last_error"]=f"Monitoramento: {type(e).__name__}: {e}"
+        except Exception as e:
+            state["last_error"]=f"Monitoramento: {type(e).__name__}: {e}"
         await asyncio.sleep(2)
 
 async def real_buy():
@@ -368,6 +427,9 @@ async def set_config(new:Config):
     new.timeframe="5m" if new.timeframe=="5m" else "1m"
     new.duracao_segundos=max(60,min(int(new.duracao_segundos),1800))
     new.take_profit_operacao=max(0,min(new.take_profit_operacao,100)); new.stop_loss_operacao=max(0,min(new.stop_loss_operacao,100))
+    new.news_exit_min_strength=max(1,min(int(new.news_exit_min_strength),20))
+    new.news_exit_confirm_pct=max(0.01,min(float(new.news_exit_confirm_pct),10))
+    new.news_check_seconds=max(30,min(int(new.news_check_seconds),600))
     config=new; return {"ok":True,"config":config.model_dump()}
 
 @app.post("/api/scan")
