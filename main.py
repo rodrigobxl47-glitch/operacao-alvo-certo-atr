@@ -117,11 +117,30 @@ async def discover_symbols():
     ordered=[s for s in PREFERRED if s in brl]+[s for s in brl if s not in PREFERRED]
     return ordered[:max(1,min(config.max_ativos,20))],t
 
-async def candles(symbol,resolution,count):
+async def raw_candles(symbol,resolution,count):
     d=await mb_get("/candles",{"symbol":symbol,"resolution":resolution,"to":int(time.time()),"countback":count})
     t,o,h,l,c=d.get("t",[]),d.get("o",[]),d.get("h",[]),d.get("l",[]),d.get("c",[])
     n=min(map(len,[t,o,h,l,c])) if all(isinstance(x,list) for x in [t,o,h,l,c]) else 0
-    return [Candle(int(t[i]),float(o[i]),float(h[i]),float(l[i]),float(c[i])) for i in range(n)]
+    rows=[Candle(int(t[i]),float(o[i]),float(h[i]),float(l[i]),float(c[i])) for i in range(n)]
+    rows.sort(key=lambda x:x.epoch)
+    return rows
+
+def aggregate_5m(rows):
+    buckets={}
+    for x in rows:
+        k=x.epoch-(x.epoch%300)
+        buckets.setdefault(k,[]).append(x)
+    out=[]
+    for k in sorted(buckets):
+        b=buckets[k]
+        out.append(Candle(k,b[0].open,max(x.high for x in b),min(x.low for x in b),b[-1].close))
+    return out
+
+async def candles(symbol,resolution,count):
+    if resolution=="5m":
+        rows=await raw_candles(symbol,"1m",max(count*5+25,825))
+        return aggregate_5m(rows)[-count:]
+    return (await raw_candles(symbol,resolution,max(count,160)))[-count:]
 
 async def news_signal(symbol):
     if not config.news_filter:return {"direction":"DESLIGADA","strength":0,"positive":0,"negative":0}
@@ -138,47 +157,94 @@ async def news_signal(symbol):
     direction="ALTA" if diff>=2 else "BAIXA" if diff<=-2 else "NEUTRA"
     return {"direction":direction,"strength":abs(diff),"positive":pos,"negative":neg}
 
+def pivots(rows,wing=2):
+    out=[]
+    for i in range(wing,len(rows)-wing):
+        seg=rows[i-wing:i+wing+1]
+        if rows[i].high==max(x.high for x in seg): out.append(("H",i,rows[i].high))
+        if rows[i].low==min(x.low for x in seg): out.append(("L",i,rows[i].low))
+    return sorted(out,key=lambda z:z[1])
+
+def structure_features(rows):
+    ps=pivots(rows[-60:],2); hs=[x for x in ps if x[0]=="H"]; ls=[x for x in ps if x[0]=="L"]
+    regime="LATERAL"
+    if len(hs)>=2 and len(ls)>=2:
+        if hs[-1][2]>hs[-2][2] and ls[-1][2]>ls[-2][2]: regime="ALTA"
+        elif hs[-1][2]<hs[-2][2] and ls[-1][2]<ls[-2][2]: regime="BAIXA"
+    abc_up=abc_dn=False
+    for i in range(max(0,len(ps)-8),len(ps)-2):
+        x,y,z=ps[i:i+3]
+        if x[0]=="L" and y[0]=="H" and z[0]=="L" and z[2]>x[2] and rows[-1].close>y[2]: abc_up=True
+        if x[0]=="H" and y[0]=="L" and z[0]=="H" and z[2]<x[2] and rows[-1].close<y[2]: abc_dn=True
+    third_sup=third_res=False
+    if len(ls)>=3:
+        v=[x[2] for x in ls[-3:]]; third_sup=(max(v)-min(v))<=sum(v)/3*0.0035
+    if len(hs)>=3:
+        v=[x[2] for x in hs[-3:]]; third_res=(max(v)-min(v))<=sum(v)/3*0.0035
+    return regime,abc_up,abc_dn,third_sup,third_res
+
 def analyze(symbol,name,primary,m15,news):
     if len(primary)<110 or len(m15)<110:
-        return Analysis(symbol,name,"AGUARDAR",0,0,0,primary[-1].close if primary else 0,["Histórico insuficiente"],news_direction=news["direction"],news_strength=news["strength"])
-    closes=[x.close for x in primary]; highs=[x.high for x in primary]; lows=[x.low for x in primary]; hlc3=[(x.high+x.low+x.close)/3 for x in primary]
+        return Analysis(symbol,name,"AGUARDAR",0,0,0,primary[-1].close if primary else 0,
+          [f"Histórico insuficiente: principal {len(primary)}/110 • M15 {len(m15)}/110"],
+          news_direction=news["direction"],news_strength=news["strength"])
+    closes=[x.close for x in primary]; highs=[x.high for x in primary]; lows=[x.low for x in primary]
+    hlc3=[(x.high+x.low+x.close)/3 for x in primary]
     e10,e100,e3,e13=ema(closes,10),ema(closes,100),ema(hlc3,3),ema(hlc3,13)
     c0,c1,c2,c3=primary[-1],primary[-2],primary[-3],primary[-4]
-    resistance=max(highs[-11:-1]); support=min(lows[-11:-1])
-    ta=c0.close>c1.close and c0.close>e10[-1] and e10[-1]>e10[-2]; tb=c0.close<c1.close and c0.close<e10[-1] and e10[-1]<e10[-2]
+    resistance=max(highs[-11:-1]); support=min(lows[-11:-1]); span=max(resistance-support,1e-12)
+    regime,abc_up,abc_dn,third_sup,third_res=structure_features(primary)
+    macro_up=c0.close>e100[-1] and e10[-1]>e100[-1]; macro_dn=c0.close<e100[-1] and e10[-1]<e100[-1]
     cross_up=e3[-2]<e13[-2] and e3[-1]>e13[-1]; cross_dn=e3[-2]>e13[-2] and e3[-1]<e13[-1]
     bull_eng=c1.close<c1.open and c0.close>c0.open and c0.open<=c1.close and c0.close>=c1.open
     bear_eng=c1.close>c1.open and c0.close<c0.open and c0.open>=c1.close and c0.close<=c1.open
-    bull_seq=c0.close>c1.close>c2.close>=c3.close; bear_seq=c0.close<c1.close<c2.close<=c3.close
-    macro_up=c0.close>e100[-1] and e10[-1]>e100[-1]; macro_dn=c0.close<e100[-1] and e10[-1]<e100[-1]
-    cl15=[x.close for x in m15]; e10_15,e100_15=ema(cl15,10),ema(cl15,100)
-    m15_up=cl15[-1]>e10_15[-1]>e100_15[-1] and e10_15[-1]>e10_15[-2]; m15_dn=cl15[-1]<e10_15[-1]<e100_15[-1] and e10_15[-1]<e10_15[-2]
+    bull_seq=c0.close>c0.open and c1.close>c1.open and c2.close>c2.open and c0.close>c1.close>c2.close
+    bear_seq=c0.close<c0.open and c1.close<c1.open and c2.close<c2.open and c0.close<c1.close<c2.close
+    body=max(abs(c0.close-c0.open),1e-12); lower=min(c0.open,c0.close)-c0.low; upper=c0.high-max(c0.open,c0.close)
+    reject_up=lower>=body*1.5 and c0.close>c0.open; reject_dn=upper>=body*1.5 and c0.close<c0.open
+    prev_res=max(highs[-12:-2]); prev_sup=min(lows[-12:-2])
+    pullback_up=c1.close>prev_res and c0.low<=prev_res*1.003 and c0.close>prev_res
+    pullback_dn=c1.close<prev_sup and c0.high>=prev_sup*0.997 and c0.close<prev_sup
+    cl15=[x.close for x in m15]; e1015,e10015=ema(cl15,10),ema(cl15,100)
+    m15_up=cl15[-1]>e1015[-1]>e10015[-1]; m15_dn=cl15[-1]<e1015[-1]<e10015[-1]
     bs=ss=0; br=[]; sr=[]
-    if ta:bs+=1;br.append(f"Tendência {config.timeframe.upper()} alta")
-    if tb:ss+=1;sr.append(f"Tendência {config.timeframe.upper()} baixa")
-    if macro_up:bs+=2;br.append("EMA10 > EMA100")
-    if macro_dn:ss+=2;sr.append("EMA10 < EMA100")
-    if cross_up:bs+=1;br.append("Cruzamento EMA3/13 alta")
-    if cross_dn:ss+=1;sr.append("Cruzamento EMA3/13 baixa")
-    if bull_eng:bs+=2;br.append("Engolfo alta")
-    if bear_eng:ss+=2;sr.append("Engolfo baixa")
-    if bull_seq:bs+=1;br.append("Sequência alta")
-    if bear_seq:ss+=1;sr.append("Sequência baixa")
-    if m15_up:bs+=2;br.append("M15 confirma alta")
-    if m15_dn:ss+=2;sr.append("M15 confirma baixa")
-    span=max(resistance-support,1e-12); pos=(c0.close-support)/span
-    if pos<=.35:bs+=1;br.append("Próximo ao suporte")
-    if pos>=.65:ss+=1;sr.append("Próximo à resistência")
-    move=abs((c0.close-c1.close)/c1.close*100) if c1.close else 0
-    volatile=move>config.max_movimento_pct
-    technical="COMPRA" if bs>=config.min_score and bs>ss else "VENDA" if ss>=config.min_score and ss>bs else "AGUARDAR"
+    if regime=="ALTA": bs+=2;br.append("Tendência ALTA por topos/fundos")
+    if regime=="BAIXA": ss+=2;sr.append("Tendência BAIXA por topos/fundos")
+    if abc_up: bs+=2;br.append("Pernadas A-B-C alta")
+    if abc_dn: ss+=2;sr.append("Pernadas A-B-C baixa")
+    if third_sup: bs+=1;br.append("3º toque no suporte")
+    if third_res: ss+=1;sr.append("3º toque na resistência")
+    if macro_up: bs+=2;br.append("EMA10 > EMA100")
+    if macro_dn: ss+=2;sr.append("EMA10 < EMA100")
+    if cross_up: bs+=1;br.append("EMA3/13 cruzou para alta")
+    if cross_dn: ss+=1;sr.append("EMA3/13 cruzou para baixa")
+    if m15_up: bs+=2;br.append("M15 confirma alta")
+    if m15_dn: ss+=2;sr.append("M15 confirma baixa")
+    if pullback_up: bs+=2;br.append("Pullback após rompimento de alta")
+    if pullback_dn: ss+=2;sr.append("Pullback após rompimento de baixa")
+    if bull_eng: bs+=2;br.append("Engolfo comprador")
+    if bear_eng: ss+=2;sr.append("Engolfo vendedor")
+    if reject_up: bs+=1;br.append("Rejeição compradora")
+    if reject_dn: ss+=1;sr.append("Rejeição vendedora")
+    if bull_seq: bs+=1;br.append("Sequência de velas compradoras")
+    if bear_seq: ss+=1;sr.append("Sequência de velas vendedoras")
+    pos=(c0.close-support)/span
+    lateral_buy=regime=="LATERAL" and pos<=0.25 and (bull_eng or reject_up or bull_seq) and not macro_dn
+    lateral_sell=regime=="LATERAL" and pos>=0.75 and (bear_eng or reject_dn or bear_seq) and not macro_up
+    if lateral_buy: bs+=3;br.append("Lateral: fundo da faixa + gatilho")
+    if lateral_sell: ss+=3;sr.append("Lateral: topo da faixa + gatilho")
+    trend_buy=regime=="ALTA" and (abc_up or macro_up) and (pullback_up or bull_eng or reject_up or bull_seq)
+    trend_sell=regime=="BAIXA" and (abc_dn or macro_dn) and (pullback_dn or bear_eng or reject_dn or bear_seq)
+    technical="COMPRA" if bs>=config.min_score and bs>ss and (trend_buy or lateral_buy) else "VENDA" if ss>=config.min_score and ss>bs and (trend_sell or lateral_sell) else "AGUARDAR"
+    move=abs((c0.close-c1.close)/c1.close*100) if c1.close else 0; volatile=move>config.max_movimento_pct
     nd=news["direction"]
-    if volatile:result="AGUARDAR"; reasons=[f"Volatilidade {config.timeframe.upper()} {move:.2f}% acima do limite"]
-    elif technical=="COMPRA" and config.news_filter and config.news_confirm_only and nd=="BAIXA":result="AGUARDAR"; reasons=br+["Notícia conflita com a alta"]
-    elif technical=="VENDA" and config.news_filter and config.news_confirm_only and nd=="ALTA":result="AGUARDAR"; reasons=sr+["Notícia conflita com a baixa"]
+    if volatile: result="AGUARDAR"; reasons=[f"Volatilidade {config.timeframe.upper()} {move:.2f}% acima do limite"]
+    elif technical=="COMPRA" and config.news_filter and config.news_confirm_only and nd=="BAIXA": result="AGUARDAR";reasons=br+["Notícia conflita com alta"]
+    elif technical=="VENDA" and config.news_filter and config.news_confirm_only and nd=="ALTA": result="AGUARDAR";reasons=sr+["Notícia conflita com baixa"]
     else:
-        result=technical; reasons=(br if technical=="COMPRA" else sr if technical=="VENDA" else (br if bs>=ss else sr)) or ["Score abaixo do mínimo"]
-        if config.news_filter:reasons.append(f"Notícias: {nd} (+{news['positive']}/-{news['negative']})")
+        result=technical; reasons=(br if bs>=ss else sr) or ["Aguardando confluência/gatilho"]
+        reasons.insert(0,f"Mercado {regime}")
+        if config.news_filter: reasons.append(f"Notícias: {nd} (+{news['positive']}/-{news['negative']})")
     return Analysis(symbol,name,result,max(bs,ss),bs,ss,c0.close,reasons,support,resistance,volatile,nd,news["strength"])
 
 def risk_ok():
@@ -197,8 +263,8 @@ async def scan_once():
         syms,table=await discover_symbols(); state["symbols"]=syms; out=[]
         for i,s in enumerate(syms,1):
             state["scan_progress"]=f"Analisando {i}/{len(syms)} • {s}"
-            primary=await candles(s,config.timeframe,140); await asyncio.sleep(1.05)
-            m15=await candles(s,"15m",120); await asyncio.sleep(1.05)
+            primary=await candles(s,config.timeframe,160); await asyncio.sleep(1.05)
+            m15=await candles(s,"15m",160); await asyncio.sleep(1.05)
             news=await news_signal(s); state["news"][s]=news
             out.append(analyze(s,table.get(s,{}).get("description",s),primary,m15,news))
         out.sort(key=lambda x:x.score,reverse=True); state["analyses"]=[asdict(x) for x in out]
