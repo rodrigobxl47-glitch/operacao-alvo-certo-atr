@@ -15,6 +15,10 @@
 <label>Tempo gráfico<select id="tf"><option value="1m">M1</option><option value="5m">M5</option></select></label>
 </div>
 <label class="check"><input id="news" type="checkbox"> Confirmação por notícias / força de mercado</label>
+<label class="check"><input id="newsexit" type="checkbox"> Proteção dinâmica: notícia contrária + preço confirma reversão</label>
+<div class="grid"><label>Força mínima da notícia<input id="newsstrength" type="number" min="1" max="20"></label>
+<label>Confirmação adversa do preço %<input id="newsconfirm" type="number" step=".05" min=".01"></label>
+<label>Checar notícias a cada (s)<input id="newsseconds" type="number" min="30" step="30"></label></div>
 <label class="check"><input id="auto" type="checkbox"> Operação automática REAL</label><button id="save">Salvar gerenciamento</button>
 <p class="muted">Preservado: EMA 10/100 • EMA 3/13 • engolfo • sequência • suporte/resistência 10 candles • tendência macro • M15 • score mínimo.</p></section>
 <section class="panel"><h2>Operação aberta</h2><div id="open">Nenhuma operação aberta.</div></section>
