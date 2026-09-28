@@ -9,3 +9,10 @@ correção do cálculo do Stop Gain/Stop Loss da sessão para usar P/L realizado
 fechamento vende somente a quantidade comprada pelo ATR
 Variáveis Render: MB_API_ID, MB_API_SECRET e opcional MB_ACCOUNT_ID. Build: pip install -r requirements.txt Start: uvicorn main:app --host 0.0.0.0 --port $PORT
 IMPORTANTE: ordens são reais. Teste primeiro scanner, saldo e controles. O fechamento por tempo é solicitado ao atingir o tempo configurado; execução real pode ocorrer alguns segundos depois por rede/API/mercado.
+V2:
+histórico ampliado para 160 candles;
+M5 agregado de M1;
+regimes ALTA/BAIXA/LATERAL;
+ABC, 3º toque, pullback/rompimento, engolfo, rejeição, sequência;
+lateral somente nos extremos da faixa com gatilho;
+score mínimo continua configurável.
