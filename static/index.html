@@ -1,17 +1,22 @@
 <!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Operação Alvo Certo (ATR)</title><link rel="stylesheet" href="/static/style.css?v=final1"></head><body><main>
-<h1>Operação Alvo Certo (ATR)</h1><p class="sub">Mercado Bitcoin • M1 + M15 • CONTA REAL</p>
+<title>Operação Alvo Certo (ATR)</title><link rel="stylesheet" href="/static/style.css?v=pro2"></head><body><main>
+<h1>Operação Alvo Certo (ATR)</h1><p class="sub">Mercado Bitcoin • M1/M5 + confirmação M15 • CONTA REAL</p>
 <section class="cards"><div><span>Banca</span><b id="balance">--</b></div><div><span>Resultado</span><b id="pnl">0.00%</b></div><div><span>Entradas</span><b id="entries">0</b></div><div><span>Status</span><b id="status">Parado</b></div></section>
 <section class="buttons"><button id="scan" class="gold">⌕ Analisar todos os ativos</button><button id="start">▶ Iniciar</button><button id="stop">■ Parar</button><button id="buy" class="buy">Enviar COMPRA REAL</button></section>
 <section class="panel"><h2>Melhores oportunidades</h2><div id="progress" class="muted"></div><div id="signals">Nenhum sinal atingiu o score mínimo.</div></section>
-<section class="panel"><h2>Gerenciamento</h2>
-<div class="grid">
-<label>% por entrada<input id="pct" type="number" step=".1"></label><label>Stop Gain %<input id="sg" type="number" step=".1"></label>
-<label>Stop Loss %<input id="sl" type="number" step=".1"></label><label>Máx. entradas<input id="maxe" type="number"></label>
+<section class="panel"><h2>Gerenciamento</h2><div class="grid">
+<label>% por entrada<input id="pct" type="number" step=".1"></label><label>Stop Gain da sessão %<input id="sg" type="number" step=".1"></label>
+<label>Stop Loss da sessão %<input id="sl" type="number" step=".1"></label><label>Máx. entradas<input id="maxe" type="number"></label>
 <label>Score mínimo<input id="score" type="number"></label><label>Máx. ativos<input id="maxa" type="number"></label>
-</div><label class="check"><input id="auto" type="checkbox"> Operação automática REAL</label><button id="save">Salvar gerenciamento</button>
-<p class="muted">Duração: <b>1 minuto</b> • M1 + confirmação M15 • filtro de volatilidade ativo.</p></section>
+</div>
+<h3>Gerenciamento da operação</h3><div class="grid">
+<label>Take Profit %<input id="tp" type="number" step=".1"></label><label>Stop Loss %<input id="opsl" type="number" step=".1"></label>
+<label>Tempo máximo (segundos)<input id="duration" type="number" min="60" max="1800" step="30"></label>
+<label>Tempo gráfico<select id="tf"><option value="1m">M1</option><option value="5m">M5</option></select></label>
+</div>
+<label class="check"><input id="news" type="checkbox"> Confirmação por notícias / força de mercado</label>
+<label class="check"><input id="auto" type="checkbox"> Operação automática REAL</label><button id="save">Salvar gerenciamento</button>
+<p class="muted">Preservado: EMA 10/100 • EMA 3/13 • engolfo • sequência • suporte/resistência 10 candles • tendência macro • M15 • score mínimo.</p></section>
 <section class="panel"><h2>Operação aberta</h2><div id="open">Nenhuma operação aberta.</div></section>
-<section class="panel"><h2>Histórico</h2><div id="history">Sem operações nesta sessão.</div></section>
-<div id="toast"></div>
-</main><script src="/static/app.js?v=final1"></script></body></html>
+<section class="panel"><h2>Histórico</h2><div id="history">Sem operações nesta sessão.</div></section><div id="toast"></div>
+</main><script src="/static/app.js?v=pro2"></script></body></html>
