@@ -1,452 +1,267 @@
-import asyncio, os, time, uuid, math
+import asyncio, json, os, secrets, hashlib, base64, time, math
 from dataclasses import dataclass, asdict, field
 from typing import List
-import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from urllib.parse import urlencode
+import httpx, websockets
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
 
-app=FastAPI(title="Operação Alvo Certo (ATR) - Mercado Bitcoin APRIMORADO")
-MB_BASE="https://api.mercadobitcoin.net/api/v4"
-GDELT="https://api.gdeltproject.org/api/v2/doc/doc"
-MB_API_ID=os.getenv("MB_API_ID","").strip()
-MB_API_SECRET=os.getenv("MB_API_SECRET","").strip()
-MB_ACCOUNT_ID=os.getenv("MB_ACCOUNT_ID","").strip()
-PREFERRED=["BTC-BRL","ETH-BRL","SOL-BRL","XRP-BRL","ADA-BRL","DOGE-BRL","LINK-BRL","LTC-BRL"]
-NEWS_NAMES={"BTC":"bitcoin","ETH":"ethereum","SOL":"solana","XRP":"xrp","ADA":"cardano","DOGE":"dogecoin","LINK":"chainlink","LTC":"litecoin"}
+app=FastAPI(title='Operação Alvo Certo ATR - Deriv MTF')
+app.add_middleware(SessionMiddleware,secret_key=os.getenv('SESSION_SECRET',secrets.token_hex(32)),https_only=True,same_site='lax')
+PUBLIC_WS='wss://api.derivws.com/trading/v1/options/ws/public'; REST_BASE='https://api.derivws.com'
+OAUTH_AUTH='https://auth.deriv.com/oauth2/auth'; OAUTH_TOKEN='https://auth.deriv.com/oauth2/token'
+CLIENT_ID=os.getenv('DERIV_CLIENT_ID',''); REDIRECT_URI=os.getenv('DERIV_REDIRECT_URI','https://operacao-alvo-certo-atr.onrender.com/auth/callback')
 
 class Config(BaseModel):
-    percentual_entrada: float=1.0
-    stop_gain: float=3.0
-    stop_loss: float=2.0
-    max_entradas: int=5
-    min_score: int=7
-    max_ativos: int=8
-    duracao_segundos: int=60
-    timeframe: str="1m"
-    take_profit_operacao: float=1.5
-    stop_loss_operacao: float=1.0
-    auto_trade: bool=False
-    max_movimento_pct: float=1.0
-    news_filter: bool=True
-    news_confirm_only: bool=True
-    news_exit_enabled: bool=True
-    news_exit_min_strength: int=3
-    news_exit_confirm_pct: float=0.15
-    news_check_seconds: int=60
-
-config=Config()
-state={"running":False,"balance":None,"available_brl":None,"start_balance":None,
-       "entries":0,"signals":[],"analyses":[],"history":[],"last_scan":None,
-       "status":"Parado","mb_connected":False,"symbols":[],"open_trade":None,
-       "scan_progress":"","last_error":None,"news":{},"realized_pnl_brl":0.0}
-_tok={"value":None,"expires":0}
-_loop_task=None
-_trade_lock=asyncio.Lock()
-
+    banca_inicial:float=1000; percentual_entrada:float=1; stop_gain:float=5; stop_loss:float=5; max_entradas:int=5; min_score:int=7; duracao_minutos:int=1
+class AccountChoice(BaseModel): account_id:str
+config=Config(); state={'running':False,'balance':1000.0,'start_balance':1000.0,'entries':0,'signals':[],'history':[],'last_scan':None,'status':'Parado','diagnostics':{}}
 @dataclass
-class Candle:
-    epoch:int; open:float; high:float; low:float; close:float
+class Candle: epoch:int; open:float; high:float; low:float; close:float
 @dataclass
-class Analysis:
-    symbol:str; name:str; result:str; score:int; buy_score:int; sell_score:int
-    price:float; reasons:List[str]=field(default_factory=list)
-    support:float=0.0; resistance:float=0.0; volatile:bool=False
-    news_direction:str="NEUTRA"; news_strength:int=0
+class Signal:
+    symbol:str; name:str; direction:str; score:int; price:float; analysis:str; confirmation:str
+    reasons:List[str]=field(default_factory=list); support:float=0; resistance:float=0; timeframes:List[str]=field(default_factory=list)
 
-def ema(vals, period):
-    if not vals:return []
-    a=2/(period+1); out=[vals[0]]
-    for v in vals[1:]:out.append(a*v+(1-a)*out[-1])
-    return out
+def body(c): return abs(c.close-c.open)
+def rng(c): return max(c.high-c.low,1e-12)
+def bull(c): return c.close>c.open
+def bear(c): return c.close<c.open
+def body_low(c): return min(c.open,c.close)
+def body_high(c): return max(c.open,c.close)
+def avg_range(cs): return sum(rng(x) for x in cs)/max(len(cs),1)
+def near(a,b,tol): return abs(a-b)<=tol
 
-async def get_token():
-    if _tok["value"] and time.time()<_tok["expires"]-30:return _tok["value"]
-    if not MB_API_ID or not MB_API_SECRET:raise RuntimeError("Configure MB_API_ID e MB_API_SECRET no Render.")
-    async with httpx.AsyncClient(timeout=20) as c:
-        r=await c.post(f"{MB_BASE}/oauth2/token",data={"grant_type":"client_credentials","scope":"global","client_id":MB_API_ID,"client_secret":MB_API_SECRET})
-        r.raise_for_status(); d=r.json()
-    _tok["value"]=d["access_token"]; _tok["expires"]=time.time()+int(d.get("expires_in",300))
-    return _tok["value"]
-
-async def mb_get(path,params=None,private=False):
-    h={}
-    if private:h["Authorization"]=f"Bearer {await get_token()}"
-    async with httpx.AsyncClient(timeout=30) as c:
-        r=await c.get(MB_BASE+path,params=params,headers=h); r.raise_for_status(); return r.json()
-
-async def mb_post(path,payload):
-    h={"Authorization":f"Bearer {await get_token()}"}
-    async with httpx.AsyncClient(timeout=30) as c:
-        r=await c.post(MB_BASE+path,json=payload,headers=h)
-        if r.status_code>=400:raise RuntimeError(f"MB {r.status_code}: {r.text[:250]}")
-        return r.json()
-
-async def account_id():
-    if MB_ACCOUNT_ID:return MB_ACCOUNT_ID
-    a=await mb_get("/accounts",private=True)
-    rows=(a.get("accounts") or a.get("data") or a.get("items") or []) if isinstance(a,dict) else a
-    valid=[x for x in rows if isinstance(x,dict) and x.get("id")]
-    if not valid:raise RuntimeError("Nenhuma conta válida retornada por /accounts.")
-    return next((x for x in valid if str(x.get("type","")).lower() in ("live","real")),valid[0])["id"]
-
-async def balances():
-    aid=await account_id(); raw=await mb_get(f"/accounts/{aid}/balances",private=True)
-    rows=(raw.get("balances") or raw.get("data") or raw.get("items") or []) if isinstance(raw,dict) else raw
-    return {str(x.get("symbol","")).upper():x for x in rows if isinstance(x,dict)}
-
-async def refresh_balance():
-    try:
-        b=await balances(); brl=b.get("BRL",{})
-        state["balance"]=float(brl.get("total",0) or 0); state["available_brl"]=float(brl.get("available",0) or 0)
-        state["mb_connected"]=True
-        if state["start_balance"] is None:state["start_balance"]=state["balance"]
-    except Exception as e:
-        state["mb_connected"]=False; state["last_error"]=f"Saldo: {type(e).__name__}: {e}"
-
-async def symbol_table():
-    d=await mb_get("/symbols"); syms=d.get("symbol",[])
-    traded=d.get("exchange-traded",[True]*len(syms)); cur=d.get("currency",[""]*len(syms)); desc=d.get("description",syms)
-    mincost=d.get("min-cost",["0"]*len(syms)); minvol=d.get("min-volume",["0"]*len(syms)); roundlot=d.get("round-lot",["0"]*len(syms))
-    out={}
-    for i,s in enumerate(syms):
-        out[s]={"symbol":s,"traded":bool(traded[i]) if i<len(traded) else True,"currency":cur[i] if i<len(cur) else "",
-                "description":desc[i] if i<len(desc) else s,"min_cost":float(mincost[i] or 0) if i<len(mincost) else 0,
-                "min_volume":float(minvol[i] or 0) if i<len(minvol) else 0,"round_lot":float(roundlot[i] or 0) if i<len(roundlot) else 0}
-    return out
-
-async def discover_symbols():
-    t=await symbol_table(); brl=[s for s,x in t.items() if x["traded"] and x["currency"]=="BRL"]
-    ordered=[s for s in PREFERRED if s in brl]+[s for s in brl if s not in PREFERRED]
-    return ordered[:max(1,min(config.max_ativos,20))],t
-
-async def raw_candles(symbol,resolution,count):
-    d=await mb_get("/candles",{"symbol":symbol,"resolution":resolution,"to":int(time.time()),"countback":count})
-    t,o,h,l,c=d.get("t",[]),d.get("o",[]),d.get("h",[]),d.get("l",[]),d.get("c",[])
-    n=min(map(len,[t,o,h,l,c])) if all(isinstance(x,list) for x in [t,o,h,l,c]) else 0
-    rows=[Candle(int(t[i]),float(o[i]),float(h[i]),float(l[i]),float(c[i])) for i in range(n)]
-    rows.sort(key=lambda x:x.epoch)
-    return rows
-
-def aggregate_5m(rows):
-    buckets={}
-    for x in rows:
-        k=x.epoch-(x.epoch%300)
-        buckets.setdefault(k,[]).append(x)
-    out=[]
-    for k in sorted(buckets):
-        b=buckets[k]
-        out.append(Candle(k,b[0].open,max(x.high for x in b),min(x.low for x in b),b[-1].close))
-    return out
-
-async def candles(symbol,resolution,count):
-    if resolution=="5m":
-        rows=await raw_candles(symbol,"1m",max(count*5+25,825))
-        return aggregate_5m(rows)[-count:]
-    return (await raw_candles(symbol,resolution,max(count,160)))[-count:]
-
-async def news_signal(symbol):
-    if not config.news_filter:return {"direction":"DESLIGADA","strength":0,"positive":0,"negative":0}
-    base=symbol.split("-")[0]; term=NEWS_NAMES.get(base,base.lower())
-    async def count(q):
-        try:
-            async with httpx.AsyncClient(timeout=12) as c:
-                r=await c.get(GDELT,params={"query":q,"mode":"artlist","maxrecords":20,"timespan":"3h","sort":"datedesc","format":"json"})
-                r.raise_for_status(); d=r.json()
-                return len(d.get("articles",[]) if isinstance(d,dict) else [])
-        except Exception:return 0
-    pos,neg=await asyncio.gather(count(f'{term} tone>2'),count(f'{term} tone<-2'))
-    diff=pos-neg
-    direction="ALTA" if diff>=2 else "BAIXA" if diff<=-2 else "NEUTRA"
-    return {"direction":direction,"strength":abs(diff),"positive":pos,"negative":neg}
-
-def pivots(rows,wing=2):
-    out=[]
-    for i in range(wing,len(rows)-wing):
-        seg=rows[i-wing:i+wing+1]
-        if rows[i].high==max(x.high for x in seg): out.append(("H",i,rows[i].high))
-        if rows[i].low==min(x.low for x in seg): out.append(("L",i,rows[i].low))
-    return sorted(out,key=lambda z:z[1])
-
-def structure_features(rows):
-    ps=pivots(rows[-60:],2); hs=[x for x in ps if x[0]=="H"]; ls=[x for x in ps if x[0]=="L"]
-    regime="LATERAL"
-    if len(hs)>=2 and len(ls)>=2:
-        if hs[-1][2]>hs[-2][2] and ls[-1][2]>ls[-2][2]: regime="ALTA"
-        elif hs[-1][2]<hs[-2][2] and ls[-1][2]<ls[-2][2]: regime="BAIXA"
-    abc_up=abc_dn=False
-    for i in range(max(0,len(ps)-8),len(ps)-2):
-        x,y,z=ps[i:i+3]
-        if x[0]=="L" and y[0]=="H" and z[0]=="L" and z[2]>x[2] and rows[-1].close>y[2]: abc_up=True
-        if x[0]=="H" and y[0]=="L" and z[0]=="H" and z[2]<x[2] and rows[-1].close<y[2]: abc_dn=True
-    third_sup=third_res=False
-    if len(ls)>=3:
-        v=[x[2] for x in ls[-3:]]; third_sup=(max(v)-min(v))<=sum(v)/3*0.0035
-    if len(hs)>=3:
-        v=[x[2] for x in hs[-3:]]; third_res=(max(v)-min(v))<=sum(v)/3*0.0035
-    return regime,abc_up,abc_dn,third_sup,third_res
-
-def analyze(symbol,name,primary,m15,news):
-    if len(primary)<110 or len(m15)<110:
-        return Analysis(symbol,name,"AGUARDAR",0,0,0,primary[-1].close if primary else 0,
-          [f"Histórico insuficiente: principal {len(primary)}/110 • M15 {len(m15)}/110"],
-          news_direction=news["direction"],news_strength=news["strength"])
-    closes=[x.close for x in primary]; highs=[x.high for x in primary]; lows=[x.low for x in primary]
-    hlc3=[(x.high+x.low+x.close)/3 for x in primary]
-    e10,e100,e3,e13=ema(closes,10),ema(closes,100),ema(hlc3,3),ema(hlc3,13)
-    c0,c1,c2,c3=primary[-1],primary[-2],primary[-3],primary[-4]
-    resistance=max(highs[-11:-1]); support=min(lows[-11:-1]); span=max(resistance-support,1e-12)
-    regime,abc_up,abc_dn,third_sup,third_res=structure_features(primary)
-    macro_up=c0.close>e100[-1] and e10[-1]>e100[-1]; macro_dn=c0.close<e100[-1] and e10[-1]<e100[-1]
-    cross_up=e3[-2]<e13[-2] and e3[-1]>e13[-1]; cross_dn=e3[-2]>e13[-2] and e3[-1]<e13[-1]
-    bull_eng=c1.close<c1.open and c0.close>c0.open and c0.open<=c1.close and c0.close>=c1.open
-    bear_eng=c1.close>c1.open and c0.close<c0.open and c0.open>=c1.close and c0.close<=c1.open
-    bull_seq=c0.close>c0.open and c1.close>c1.open and c2.close>c2.open and c0.close>c1.close>c2.close
-    bear_seq=c0.close<c0.open and c1.close<c1.open and c2.close<c2.open and c0.close<c1.close<c2.close
-    body=max(abs(c0.close-c0.open),1e-12); lower=min(c0.open,c0.close)-c0.low; upper=c0.high-max(c0.open,c0.close)
-    reject_up=lower>=body*1.5 and c0.close>c0.open; reject_dn=upper>=body*1.5 and c0.close<c0.open
-    prev_res=max(highs[-12:-2]); prev_sup=min(lows[-12:-2])
-    pullback_up=c1.close>prev_res and c0.low<=prev_res*1.003 and c0.close>prev_res
-    pullback_dn=c1.close<prev_sup and c0.high>=prev_sup*0.997 and c0.close<prev_sup
-    cl15=[x.close for x in m15]; e1015,e10015=ema(cl15,10),ema(cl15,100)
-    m15_up=cl15[-1]>e1015[-1]>e10015[-1]; m15_dn=cl15[-1]<e1015[-1]<e10015[-1]
-    bs=ss=0; br=[]; sr=[]
-    if regime=="ALTA": bs+=2;br.append("Tendência ALTA por topos/fundos")
-    if regime=="BAIXA": ss+=2;sr.append("Tendência BAIXA por topos/fundos")
-    if abc_up: bs+=2;br.append("Pernadas A-B-C alta")
-    if abc_dn: ss+=2;sr.append("Pernadas A-B-C baixa")
-    if third_sup: bs+=1;br.append("3º toque no suporte")
-    if third_res: ss+=1;sr.append("3º toque na resistência")
-    if macro_up: bs+=2;br.append("EMA10 > EMA100")
-    if macro_dn: ss+=2;sr.append("EMA10 < EMA100")
-    if cross_up: bs+=1;br.append("EMA3/13 cruzou para alta")
-    if cross_dn: ss+=1;sr.append("EMA3/13 cruzou para baixa")
-    if m15_up: bs+=2;br.append("M15 confirma alta")
-    if m15_dn: ss+=2;sr.append("M15 confirma baixa")
-    if pullback_up: bs+=2;br.append("Pullback após rompimento de alta")
-    if pullback_dn: ss+=2;sr.append("Pullback após rompimento de baixa")
-    if bull_eng: bs+=2;br.append("Engolfo comprador")
-    if bear_eng: ss+=2;sr.append("Engolfo vendedor")
-    if reject_up: bs+=1;br.append("Rejeição compradora")
-    if reject_dn: ss+=1;sr.append("Rejeição vendedora")
-    if bull_seq: bs+=1;br.append("Sequência de velas compradoras")
-    if bear_seq: ss+=1;sr.append("Sequência de velas vendedoras")
-    pos=(c0.close-support)/span
-    lateral_buy=regime=="LATERAL" and pos<=0.25 and (bull_eng or reject_up or bull_seq) and not macro_dn
-    lateral_sell=regime=="LATERAL" and pos>=0.75 and (bear_eng or reject_dn or bear_seq) and not macro_up
-    if lateral_buy: bs+=3;br.append("Lateral: fundo da faixa + gatilho")
-    if lateral_sell: ss+=3;sr.append("Lateral: topo da faixa + gatilho")
-    trend_buy=regime=="ALTA" and (abc_up or macro_up) and (pullback_up or bull_eng or reject_up or bull_seq)
-    trend_sell=regime=="BAIXA" and (abc_dn or macro_dn) and (pullback_dn or bear_eng or reject_dn or bear_seq)
-    # Não compra uma alta já encostada na resistência: exige espaço mínimo até o topo da faixa.
-    room_up=((resistance-c0.close)/c0.close*100) if c0.close else 0
-    room_down=((c0.close-support)/c0.close*100) if c0.close else 0
-    min_room=max(0.20, config.take_profit_operacao*0.50)
-    buy_context=(trend_buy or lateral_buy) and (lateral_buy or room_up>=min_room or pullback_up)
-    sell_context=(trend_sell or lateral_sell) and (lateral_sell or room_down>=min_room or pullback_dn)
-    if not buy_context and bs>=config.min_score: br.append(f"Sem espaço suficiente até resistência ({room_up:.2f}%)")
-    if not sell_context and ss>=config.min_score: sr.append(f"Sem espaço suficiente até suporte ({room_down:.2f}%)")
-    technical="COMPRA" if bs>=config.min_score and bs>ss and buy_context else "VENDA" if ss>=config.min_score and ss>bs and sell_context else "AGUARDAR"
-    move_signed=((c0.close-c1.close)/c1.close*100) if c1.close else 0
-    move=abs(move_signed)
-    volatile=move>config.max_movimento_pct
-
-    # Volatilidade adaptativa:
-    # não bloqueia automaticamente um impulso forte quando TODA a estrutura confirma.
-    strong_buy_impulse=(
-        volatile and move_signed>0 and regime=="ALTA" and m15_up and
-        (abc_up or pullback_up) and (bull_eng or bull_seq or pullback_up) and
-        bs>=max(config.min_score,8) and bs>=ss+3 and buy_context
-    )
-    strong_sell_impulse=(
-        volatile and move_signed<0 and regime=="BAIXA" and m15_dn and
-        (abc_dn or pullback_dn) and (bear_eng or bear_seq or pullback_dn) and
-        ss>=max(config.min_score,8) and ss>=bs+3 and sell_context
-    )
-    volatility_ok=(not volatile) or strong_buy_impulse or strong_sell_impulse
-    if strong_buy_impulse: br.append(f"Impulso forte validado ({move:.2f}%): tendência + M15 + estrutura/gatilho")
-    if strong_sell_impulse: sr.append(f"Impulso forte de baixa validado ({move:.2f}%): tendência + M15 + estrutura/gatilho")
-
-    nd=news["direction"]
-    if not volatility_ok:
-        result="AGUARDAR"
-        reasons=[f"Volatilidade {config.timeframe.upper()} {move:.2f}%: movimento esticado/sem confirmação suficiente"]
-    elif technical=="COMPRA" and config.news_filter and config.news_confirm_only and nd=="BAIXA": result="AGUARDAR";reasons=br+["Notícia conflita com alta"]
-    elif technical=="VENDA" and config.news_filter and config.news_confirm_only and nd=="ALTA": result="AGUARDAR";reasons=sr+["Notícia conflita com baixa"]
+def candle_pattern(cs, side):
+    if len(cs)<4:return None
+    a,b,c=cs[-1],cs[-2],cs[-3]
+    ar=max(avg_range(cs[-20:]),1e-12); eps=ar*.08
+    if side=='CALL':
+        lowwick=body_low(a)-a.low; upwick=a.high-body_high(a)
+        if bull(a) and lowwick>=2*max(body(a),eps) and upwick<=max(body(a),eps)*.7:return 'Martelo (Hammer)'
+        if bull(a) and upwick>=2*max(body(a),eps) and lowwick<=max(body(a),eps)*.7:return 'Martelo Invertido (Inverted Hammer)'
+        if bear(b) and bull(a) and a.open<=b.close and a.close>=b.open:return 'Engolfo de Alta (Bullish Engulfing)'
+        if bear(c) and body(b)<=body(c)*.5 and bull(a) and a.close>(c.open+c.close)/2:return 'Estrela da Manhã (Morning Star)'
+        if bear(b) and bull(a) and a.open<b.low+ar*.15 and a.close>(b.open+b.close)/2 and a.close<b.open:return 'Piercing Line'
+        if bear(b) and bull(a) and body_low(a)>=body_low(b) and body_high(a)<=body_high(b):return 'Harami de Alta (Bullish Harami)'
+        if all(bull(x) for x in cs[-3:]) and cs[-1].close>cs[-2].close>cs[-3].close:return 'Três Soldados Brancos (Three White Soldiers)'
+        if bull(a) and body(a)/rng(a)>=.85:return 'Marubozu de Alta (Bullish Marubozu)'
     else:
-        result=technical; reasons=(br if bs>=ss else sr) or ["Aguardando confluência/gatilho"]
-        reasons.insert(0,f"Mercado {regime}")
-        if config.news_filter: reasons.append(f"Notícias: {nd} (+{news['positive']}/-{news['negative']})")
-    return Analysis(symbol,name,result,max(bs,ss),bs,ss,c0.close,reasons,support,resistance,volatile,nd,news["strength"])
+        lowwick=body_low(a)-a.low; upwick=a.high-body_high(a)
+        if bear(a) and upwick>=2*max(body(a),eps) and lowwick<=max(body(a),eps)*.7:return 'Estrela Cadente (Shooting Star)'
+        if bear(a) and lowwick>=2*max(body(a),eps) and upwick<=max(body(a),eps)*.7:return 'Homem Enforcado (Hanging Man)'
+        if bull(b) and bear(a) and a.open>=b.close and a.close<=b.open:return 'Engolfo de Baixa (Bearish Engulfing)'
+        if bull(c) and body(b)<=body(c)*.5 and bear(a) and a.close<(c.open+c.close)/2:return 'Estrela da Noite (Evening Star)'
+        if bull(b) and bear(a) and a.open>b.high-ar*.15 and a.close<(b.open+b.close)/2 and a.close>b.open:return 'Dark Cloud Cover'
+        if bull(b) and bear(a) and body_low(a)>=body_low(b) and body_high(a)<=body_high(b):return 'Harami de Baixa (Bearish Harami)'
+        if all(bear(x) for x in cs[-3:]) and cs[-1].close<cs[-2].close<cs[-3].close:return 'Três Corvos Negros (Three Black Crows)'
+        if bear(a) and body(a)/rng(a)>=.85:return 'Marubozu de Baixa (Bearish Marubozu)'
+    return None
 
-def risk_ok():
-    if state["open_trade"]:return False,"Já existe operação aberta"
-    if state["balance"] is None:return False,"Banca indisponível"
-    start=state["start_balance"] or state["balance"]
-    pnl=(state["realized_pnl_brl"]/start*100) if start else 0
-    if pnl>=config.stop_gain:return False,"Stop Gain da sessão atingido"
-    if pnl<=-config.stop_loss:return False,"Stop Loss da sessão atingido"
-    if state["entries"]>=config.max_entradas:return False,"Limite de entradas atingido"
-    return True,"OK"
+def pivots(cs, span=2):
+    hi=[]; lo=[]
+    for i in range(span,len(cs)-span):
+        if cs[i].high>=max(x.high for x in cs[i-span:i+span+1]):hi.append((i,cs[i].high))
+        if cs[i].low<=min(x.low for x in cs[i-span:i+span+1]):lo.append((i,cs[i].low))
+    return hi,lo
 
+def line3(points, cs, side):
+    if len(points)<3:return None
+    ar=avg_range(cs[-30:]); tol=ar*.45
+    # find recent triples whose pivots form a rising support or falling resistance line
+    for trio in [points[-3:], points[-4:-1] if len(points)>=4 else []]:
+        if len(trio)<3:continue
+        (i1,p1),(i2,p2),(i3,p3)=trio
+        if i3==i1:continue
+        slope=(p3-p1)/(i3-i1); expected=p1+slope*(i2-i1)
+        if abs(p2-expected)>tol:continue
+        if side=='CALL' and slope<=0:continue
+        if side=='PUT' and slope>=0:continue
+        projected=p1+slope*((len(cs)-1)-i1)
+        if abs((cs[-1].low if side=='CALL' else cs[-1].high)-projected)<=ar*.8:
+            return projected
+    return None
+
+def sr_third_touch(cs, side):
+    hi,lo=pivots(cs); pts=lo if side=='CALL' else hi
+    if len(pts)<2:return None
+    ar=avg_range(cs[-30:]); tol=ar*.45
+    recent=pts[-8:]
+    for _,level in reversed(recent):
+        matches=[p for _,p in recent if near(p,level,tol)]
+        if len(matches)>=2:
+            # confirmation by candle BODY near level; wick alone is not enough
+            a=cs[-1]; touch=near(body_low(a) if side=='CALL' else body_high(a),level,ar*.7)
+            if touch:return sum(matches)/len(matches)
+    return None
+
+def double_level(cs, side):
+    hi,lo=pivots(cs); pts=lo if side=='CALL' else hi
+    if len(pts)<2:return None
+    ar=avg_range(cs[-30:]); tol=ar*.4
+    p1,p2=pts[-2][1],pts[-1][1]
+    if near(p1,p2,tol):return (p1+p2)/2
+    return None
+
+def abc_confluence(cs, side):
+    hi,lo=pivots(cs)
+    if side=='CALL' and len(hi)>=2 and len(lo)>=2:
+        return hi[-1][1]>hi[-2][1] and lo[-1][1]>lo[-2][1]
+    if side=='PUT' and len(hi)>=2 and len(lo)>=2:
+        return hi[-1][1]<hi[-2][1] and lo[-1][1]<lo[-2][1]
+    return False
+
+def timeframe_analysis(cs, side):
+    pat=candle_pattern(cs,side); hi,lo=pivots(cs); ar=avg_range(cs[-30:]); last=cs[-1]
+    sup=min(x.low for x in cs[-20:]); res=max(x.high for x in cs[-20:])
+    trend=line3(lo if side=='CALL' else hi,cs,side)
+    sr=sr_third_touch(cs,side); dbl=double_level(cs,side); abc=abc_confluence(cs,side)
+    breakout=False
+    if side=='CALL': breakout=last.close>max(x.high for x in cs[-21:-1])+ar*.05
+    else: breakout=last.close<min(x.low for x in cs[-21:-1])-ar*.05
+    return {'pattern':pat,'trend3':trend is not None,'abc':abc,'sr3':sr is not None,'double':dbl is not None,'breakout':breakout,'support':sup,'resistance':res}
+
+def analyze(symbol,name,m1,m5,m15):
+    if min(len(m1),len(m5),len(m15))<110:return None
+    tfs={'M1':m1[-110:],'M5':m5[-110:],'M15':m15[-110:]}; candidates=[]
+    for side in ('CALL','PUT'):
+        A={tf:timeframe_analysis(cs,side) for tf,cs in tfs.items()}
+        # Three-timeframe agreement: each timeframe must support same structural setup.
+        trend_all=all(x['trend3'] and x['abc'] for x in A.values())
+        sr_all=all((x['sr3'] or x['double']) for x in A.values())
+        breakout_all=all(x['breakout'] for x in A.values())
+        pat=A['M1']['pattern']
+        # Entry confirmation is on the just-closed M1 candle, after M1/M5/M15 structural agreement.
+        if not pat:continue
+        if trend_all: candidates.append((10,'Tendência de alta — 3º toque + pernas A/B/C' if side=='CALL' else 'Tendência de baixa — 3º toque + pernas A/B/C',side,A,pat))
+        if sr_all: candidates.append((9,'Suporte/Resistência — 3º toque / topo-fundo duplo',side,A,pat))
+        if breakout_all: candidates.append((8,'Rompimento confirmado nos 3 tempos',side,A,pat))
+    if not candidates:return None
+    score,analysis,side,A,pat=max(candidates,key=lambda z:z[0])
+    reasons=[analysis,'Confluência M1 + M5 + M15','110 candles por tempo gráfico',f'Confirmação M1: {pat}']
+    if all(x['abc'] for x in A.values()):reasons.append('Pernadas A/B/C alinhadas')
+    if all(x['sr3'] or x['double'] for x in A.values()):reasons.append('3º toque / nível duplo confirmado por corpo')
+    if all(x['breakout'] for x in A.values()):reasons.append('Rompimento no mesmo sentido')
+    return Signal(symbol,name,side,score,m1[-1].close,analysis,pat,reasons,A['M1']['support'],A['M1']['resistance'],['M1','M5','M15'])
+
+async def ws_public(payload,req_id=1):
+    async with websockets.connect(PUBLIC_WS,ping_interval=20,ping_timeout=20,open_timeout=15) as ws:
+        p=dict(payload);p['req_id']=req_id;await ws.send(json.dumps(p))
+        while True:
+            d=json.loads(await ws.recv())
+            if d.get('req_id')==req_id:
+                if 'error' in d:raise RuntimeError(d['error'].get('message','Erro Deriv'))
+                return d
+async def active_symbols():return (await ws_public({'active_symbols':'brief','contract_type':['CALL','PUT']},100)).get('active_symbols',[])
+def sym_fields(a):return a.get('underlying_symbol') or a.get('symbol'), a.get('underlying_symbol_name') or a.get('display_name') or a.get('underlying_symbol') or a.get('symbol')
+def is_derived(a):
+    vals=' '.join(str(a.get(k,'')) for k in ('market','submarket','subgroup','underlying_symbol_type','symbol_type','underlying_symbol_name','display_name')).lower()
+    # Deriv commonly labels these markets synthetic/derived; include named synthetic families.
+    keys=('synthetic','derived','volatility','crash','boom','jump','step','range break','drift switch','daily reset','dex')
+    return any(k in vals for k in keys)
+async def candles(symbol,granularity,count=110):
+    d=await ws_public({'ticks_history':symbol,'adjust_start_time':1,'count':count,'end':'latest','granularity':granularity,'style':'candles'},1000+granularity)
+    out=[]
+    for c in d.get('candles',[]):
+        try:out.append(Candle(int(c['epoch']),float(c['open']),float(c['high']),float(c['low']),float(c['close'])))
+        except:pass
+    return out
+async def analyze_one(a,sem):
+    async with sem:
+        symbol,name=sym_fields(a)
+        if not symbol:return None
+        try:
+            m1=await candles(symbol,60); await asyncio.sleep(.08); m5=await candles(symbol,300); await asyncio.sleep(.08); m15=await candles(symbol,900)
+            return analyze(symbol,name,m1,m5,m15)
+        except Exception:return None
 async def scan_once():
-    state["status"]="Analisando mercados..."; state["last_error"]=None
-    try:
-        syms,table=await discover_symbols(); state["symbols"]=syms; out=[]
-        for i,s in enumerate(syms,1):
-            state["scan_progress"]=f"Analisando {i}/{len(syms)} • {s}"
-            primary=await candles(s,config.timeframe,160); await asyncio.sleep(1.05)
-            m15=await candles(s,"15m",160); await asyncio.sleep(1.05)
-            news=await news_signal(s); state["news"][s]=news
-            out.append(analyze(s,table.get(s,{}).get("description",s),primary,m15,news))
-        out.sort(key=lambda x:x.score,reverse=True); state["analyses"]=[asdict(x) for x in out]
-        state["signals"]=[asdict(x) for x in out if x.result!="AGUARDAR"]; state["last_scan"]=int(time.time())
-        state["status"]=f"{len(syms)} ativos analisados"; state["scan_progress"]=""; await refresh_balance(); return state["analyses"]
-    except Exception as e:
-        state["status"]="Erro na análise"; state["scan_progress"]=""; state["last_error"]=f"{type(e).__name__}: {e}"; raise
+    state['status']='Analisando índices derivados M1/M5/M15...'; allsyms=await active_symbols(); syms=[a for a in allsyms if is_derived(a)]
+    sem=asyncio.Semaphore(3); results=await asyncio.gather(*[analyze_one(a,sem) for a in syms]); sig=[x for x in results if x];sig.sort(key=lambda x:x.score,reverse=True)
+    state['signals']=[asdict(x) for x in sig[:25]];state['last_scan']=int(time.time());state['status']=f'{len(syms)} índices derivados analisados • M1/M5/M15';state['diagnostics']={'ativos_derivados':len(syms),'sinais':len(sig),'candles_por_tf':110,'timeframes':['M1','M5','M15']}
+    return state['signals']
 
-async def ticker(symbol):
-    d=await mb_get("/tickers",{"symbols":symbol}); return float(d[0]["last"])
-
-async def wait_order(aid,symbol,oid,seconds=12):
-    last=None
-    for _ in range(seconds):
-        last=await mb_get(f"/accounts/{aid}/{symbol}/orders/{oid}",private=True)
-        if last.get("status")=="filled":return last
-        await asyncio.sleep(1)
-    return last or {}
-
-def floor_step(q,step):
-    return math.floor(q/step)*step if step else q
-
-async def close_position(reason):
-    tr=state.get("open_trade")
-    if not tr:return
-    aid=await account_id(); symbol=tr["symbol"]; qty=float(tr["qty"]); table=await symbol_table(); meta=table.get(symbol,{})
-    qty=floor_step(qty,float(meta.get("round_lot",0) or 0))
-    if qty<=0:raise RuntimeError("Quantidade de venda inválida.")
-    resp=await mb_post(f"/accounts/{aid}/{symbol}/orders",{"type":"market","side":"sell","qty":f"{qty:.12f}".rstrip("0").rstrip("."),"async":False,"externalId":"ATR-"+uuid.uuid4().hex[:18]})
-    od=await wait_order(aid,symbol,resp["orderId"]); exit_price=float(od.get("avgPrice") or await ticker(symbol))
-    buy_fee=float(tr.get("buy_fee") or 0); sell_fee=float(od.get("fee") or 0)
-    gross=(exit_price-tr["entry_price"])*qty
-    net=gross-buy_fee-sell_fee
-    item={**tr,"exit_time":int(time.time()),"exit_price":exit_price,"result":"FECHADA","close_reason":reason,
-          "gross_pnl_brl":round(gross,6),"buy_fee":buy_fee,"sell_fee":sell_fee,"pnl_brl":round(net,6),"sell_order_id":resp["orderId"]}
-    state["realized_pnl_brl"]+=net; state["history"].insert(0,item); state["history"]=state["history"][:50]
-    state["open_trade"]=None; state["status"]=f"Operação fechada • {reason}"; await refresh_balance()
-
-async def monitor_trade():
-    last_news_check=0
-    adverse_hits=0
-    while state.get("open_trade"):
-        tr=state["open_trade"]
-        try:
-            px=await ticker(tr["symbol"]); tr["current_price"]=px
-            pct=(px-tr["entry_price"])/tr["entry_price"]*100 if tr["entry_price"] else 0
-            tr["current_pnl_percent"]=pct
-            reason=None
-
-            # Proteções duras sempre têm prioridade.
-            if config.take_profit_operacao>0 and pct>=config.take_profit_operacao:
-                reason="TAKE PROFIT"
-            elif config.stop_loss_operacao>0 and pct<=-config.stop_loss_operacao:
-                reason="STOP LOSS"
-            elif time.time()>=tr["expires_at"]:
-                reason="TEMPO MÁXIMO"
-
-            # Proteção por notícia: não sai apenas por manchete/tom.
-            # Exige notícia contrária + força mínima + confirmação do preço em queda.
-            if not reason and config.news_filter and config.news_exit_enabled and time.time()-last_news_check>=config.news_check_seconds:
-                ns=await news_signal(tr["symbol"])
-                state["news"][tr["symbol"]]=ns
-                tr["news_direction"]=ns["direction"]; tr["news_strength"]=ns["strength"]
-                last_news_check=time.time()
-                adverse=(tr["direction"]=="COMPRA" and ns["direction"]=="BAIXA" and ns["strength"]>=config.news_exit_min_strength)
-                price_confirms=(pct<=-abs(config.news_exit_confirm_pct))
-                if adverse and price_confirms:
-                    adverse_hits+=1
-                else:
-                    adverse_hits=0
-                tr["news_adverse_hits"]=adverse_hits
-                if adverse_hits>=1:
-                    reason="REVERSÃO: NOTÍCIA + PREÇO"
-
-            if reason:
-                async with _trade_lock:
-                    if state.get("open_trade"): await close_position(reason)
-                return
-        except Exception as e:
-            state["last_error"]=f"Monitoramento: {type(e).__name__}: {e}"
-        await asyncio.sleep(2)
-
-async def real_buy():
-    async with _trade_lock:
-        ok,msg=risk_ok()
-        if not ok:return {"ok":False,"message":msg}
-        best=next((x for x in state["signals"] if x["result"]=="COMPRA"),None)
-        if not best:return {"ok":False,"message":"Nenhum sinal de COMPRA com score mínimo."}
-        await refresh_balance(); _,table=await discover_symbols(); meta=table.get(best["symbol"],{})
-        stake=round((state["available_brl"] or 0)*config.percentual_entrada/100,2); min_cost=float(meta.get("min_cost",0) or 0)
-        if stake<min_cost:return {"ok":False,"message":f"Entrada calculada R$ {stake:.2f} abaixo do mínimo R$ {min_cost:.2f} de {best['symbol']}."}
-        aid=await account_id()
-        resp=await mb_post(f"/accounts/{aid}/{best['symbol']}/orders",{"type":"market","side":"buy","cost":stake,"async":False,"externalId":"ATR-"+uuid.uuid4().hex[:18]})
-        od=await wait_order(aid,best["symbol"],resp["orderId"]); qty=float(od.get("filledQty") or 0); price=float(od.get("avgPrice") or best["price"])
-        if qty<=0:return {"ok":False,"message":"A compra foi enviada, mas ainda não há quantidade executada. Verifique a ordem no MB."}
-        tr={"entry_time":int(time.time()),"expires_at":int(time.time())+config.duracao_segundos,"symbol":best["symbol"],"direction":"COMPRA",
-            "score":best["score"],"stake":stake,"entry_price":price,"current_price":price,"current_pnl_percent":0.0,"qty":qty,
-            "buy_fee":float(od.get("fee") or 0),"buy_order_id":resp["orderId"],"result":"ABERTA"}
-        state["open_trade"]=tr; state["entries"]+=1; state["status"]="Operação REAL aberta • TP/SL/tempo monitorando"
-        asyncio.create_task(monitor_trade()); return {"ok":True,"entry":tr}
-
-async def scanner_loop():
-    while state["running"]:
-        try:
-            await scan_once()
-            if config.auto_trade and not state["open_trade"]:await real_buy()
-        except Exception:pass
-        await asyncio.sleep(12)
-
-@app.on_event("startup")
-async def startup():await refresh_balance()
-
-@app.get("/")
-async def home():return FileResponse("static/index.html")
-
-@app.get("/api/status")
-async def api_status():
-    await refresh_balance()
-    start=state["start_balance"]; pnl=(state["realized_pnl_brl"]/start*100) if start else 0
-    countdown=max(0,int(state["open_trade"]["expires_at"]-time.time())) if state["open_trade"] else 0
-    return {**state,"config":config.model_dump(),"pnl_percent":round(pnl,4),"countdown":countdown}
-
-@app.post("/api/config")
+async def deriv_rest(request,method,path):
+    token=request.session.get('deriv_token')
+    if not token:raise HTTPException(401,'Conecte sua conta Deriv primeiro.')
+    async with httpx.AsyncClient(timeout=20) as client:r=await client.request(method,REST_BASE+path,headers={'Authorization':f'Bearer {token}'})
+    try:d=r.json()
+    except:d={'error':r.text}
+    if r.status_code>=400:raise HTTPException(r.status_code,d)
+    return d
+async def get_accounts(request):
+    d=await deriv_rest(request,'GET','/trading/v1/options/accounts');return d.get('data',d if isinstance(d,list) else [])
+def account_type(a):return str(a.get('account_type','')).lower()
+@app.get('/')
+async def home():return FileResponse('static/index.html')
+@app.get('/auth/login')
+async def auth_login(request:Request):
+    if not CLIENT_ID:raise HTTPException(500,'Configure DERIV_CLIENT_ID no Render.')
+    verifier=secrets.token_urlsafe(64)[:96];challenge=base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode();st=secrets.token_urlsafe(24)
+    request.session['pkce_verifier']=verifier;request.session['oauth_state']=st
+    q=urlencode({'response_type':'code','client_id':CLIENT_ID,'redirect_uri':REDIRECT_URI,'scope':'trade','state':st,'code_challenge':challenge,'code_challenge_method':'S256'})
+    return RedirectResponse(OAUTH_AUTH+'?'+q)
+@app.get('/auth/callback')
+async def auth_callback(request:Request,code:str='',state_q:str='',state:str='',error:str=''):
+    if error:return RedirectResponse('/?deriv=error')
+    returned_state=state or state_q
+    if not code or returned_state!=request.session.get('oauth_state'):raise HTTPException(400,'Callback OAuth inválido/state não confere.')
+    verifier=request.session.pop('pkce_verifier',None);request.session.pop('oauth_state',None)
+    async with httpx.AsyncClient(timeout=20) as client:r=await client.post(OAUTH_TOKEN,data={'grant_type':'authorization_code','client_id':CLIENT_ID,'code':code,'code_verifier':verifier,'redirect_uri':REDIRECT_URI})
+    d=r.json()
+    if r.status_code>=400 or not d.get('access_token'):raise HTTPException(400,d)
+    request.session['deriv_token']=d['access_token'];return RedirectResponse('/?deriv=connected')
+@app.post('/auth/logout')
+async def logout(request:Request):request.session.clear();return {'ok':True}
+@app.get('/api/deriv/accounts')
+async def api_accounts(request:Request):
+    if not request.session.get('deriv_token'):return {'connected':False,'accounts':[],'selected':None}
+    accounts=await get_accounts(request);return {'connected':True,'accounts':accounts,'selected':request.session.get('deriv_account_id')}
+@app.post('/api/deriv/select')
+async def select_account(choice:AccountChoice,request:Request):
+    accounts=await get_accounts(request);acc=next((a for a in accounts if a.get('account_id')==choice.account_id),None)
+    if not acc:raise HTTPException(404,'Conta não encontrada.')
+    request.session['deriv_account_id']=choice.account_id;request.session['deriv_account_type']=account_type(acc);state['balance']=float(acc.get('balance',state['balance']));state['start_balance']=state['balance'];return {'ok':True,'account':acc}
+async def authenticated_ws_url(request):
+    aid=request.session.get('deriv_account_id')
+    if not aid:raise HTTPException(400,'Selecione uma conta DEMO ou REAL.')
+    d=await deriv_rest(request,'POST',f'/trading/v1/options/accounts/{aid}/otp');data=d.get('data',d);url=data.get('url') or data.get('websocket_url')
+    if not url:raise HTTPException(502,f'Deriv não retornou URL WebSocket: {d}')
+    return url
+async def trade_best(request):
+    if not state['signals']:await scan_once()
+    if not state['signals']:raise HTTPException(400,'Nenhuma confluência M1/M5/M15 confirmada.')
+    aid=request.session.get('deriv_account_id');typ=request.session.get('deriv_account_type','')
+    if not aid:raise HTTPException(400,'Selecione a conta Deriv.')
+    best=state['signals'][0];accounts=await get_accounts(request);acc=next((a for a in accounts if a.get('account_id')==aid),None)
+    if not acc:raise HTTPException(404,'Conta selecionada não está disponível.')
+    balance=float(acc.get('balance',0));stake=round(balance*config.percentual_entrada/100,2)
+    if stake<=0:raise HTTPException(400,'Valor da entrada inválido.')
+    url=await authenticated_ws_url(request)
+    async with websockets.connect(url,ping_interval=20,ping_timeout=20) as ws:
+        proposal={'proposal':1,'amount':stake,'basis':'stake','contract_type':best['direction'],'currency':acc.get('currency','USD'),'duration':config.duracao_minutos,'duration_unit':'m','underlying_symbol':best['symbol'],'req_id':501}
+        await ws.send(json.dumps(proposal));pd=json.loads(await ws.recv())
+        if 'error' in pd:raise HTTPException(400,pd['error'].get('message','Erro na proposta'))
+        prop=pd.get('proposal',{});pid=prop.get('id')
+        if not pid:raise HTTPException(400,f'Proposta sem ID: {pd}')
+        ask=float(prop.get('ask_price',stake));await ws.send(json.dumps({'buy':pid,'price':ask,'req_id':502}));bd=json.loads(await ws.recv())
+        if 'error' in bd:raise HTTPException(400,bd['error'].get('message','Erro ao comprar contrato'))
+    entry={'time':int(time.time()),'symbol':best['symbol'],'name':best['name'],'direction':best['direction'],'score':best['score'],'stake':stake,'result':'ENVIADA DERIV','mode':typ.upper(),'analysis':best['analysis'],'confirmation':best['confirmation'],'buy':bd.get('buy',{})}
+    state['history'].insert(0,entry);state['history']=state['history'][:50];state['entries']+=1;state['status']=f"Ordem {typ.upper()} enviada: {best['direction']} {best['name']}";return {'ok':True,'entry':entry,'raw':bd}
+@app.post('/api/deriv/trade')
+async def deriv_trade(request:Request):return await trade_best(request)
+@app.get('/api/status')
+async def get_status():
+    start=state['start_balance'];pnl=((state['balance']-start)/start)*100 if start else 0;return {**state,'config':config.model_dump(),'pnl_percent':round(pnl,2)}
+@app.post('/api/config')
 async def set_config(new:Config):
-    global config
-    new.min_score=max(1,min(new.min_score,12)); new.max_ativos=max(1,min(new.max_ativos,20))
-    new.timeframe="5m" if new.timeframe=="5m" else "1m"
-    new.duracao_segundos=max(60,min(int(new.duracao_segundos),1800))
-    new.take_profit_operacao=max(0,min(new.take_profit_operacao,100)); new.stop_loss_operacao=max(0,min(new.stop_loss_operacao,100))
-    new.news_exit_min_strength=max(1,min(int(new.news_exit_min_strength),20))
-    new.news_exit_confirm_pct=max(0.01,min(float(new.news_exit_confirm_pct),10))
-    new.news_check_seconds=max(30,min(int(new.news_check_seconds),600))
-    config=new; return {"ok":True,"config":config.model_dump()}
-
-@app.post("/api/scan")
-async def api_scan():
-    try:return {"ok":True,"analyses":await scan_once()}
-    except Exception as e:raise HTTPException(500,str(e))
-@app.post("/api/start")
-async def start():
-    global _loop_task
-    state["running"]=True; state["status"]="Ativo"
-    if not _loop_task or _loop_task.done():_loop_task=asyncio.create_task(scanner_loop())
-    return {"ok":True}
-@app.post("/api/stop")
-async def stop():
-    state["running"]=False; state["status"]="Parado"
-    return {"ok":True,"message":"Scanner parado. Operação aberta continua protegida por TP/SL/tempo."}
-@app.post("/api/real-entry")
-async def entry():return await real_buy()
-
-app.mount("/static",StaticFiles(directory="static"),name="static")
+    global config;config=new;return {'ok':True,'config':config.model_dump()}
+@app.post('/api/scan')
+async def api_scan():return {'signals':await scan_once()}
+@app.post('/api/start')
+async def start():state['running']=True;state['status']='Ativo • índices derivados • M1/M5/M15';return {'ok':True}
+@app.post('/api/stop')
+async def stop():state['running']=False;state['status']='Parado';return {'ok':True}
+app.mount('/static',StaticFiles(directory='static'),name='static')
