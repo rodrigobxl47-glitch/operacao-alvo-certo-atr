@@ -1,26 +1,11 @@
-<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Operação Alvo Certo (ATR)</title><link rel="stylesheet" href="/static/style.css?v=pro2"></head><body><main>
-<h1>Operação Alvo Certo (ATR)</h1><p class="sub">Mercado Bitcoin • M1/M5 + confirmação M15 • CONTA REAL</p>
-<section class="cards"><div><span>Banca</span><b id="balance">--</b></div><div><span>Resultado</span><b id="pnl">0.00%</b></div><div><span>Entradas</span><b id="entries">0</b></div><div><span>Status</span><b id="status">Parado</b></div></section>
-<section class="buttons"><button id="scan" class="gold">⌕ Analisar todos os ativos</button><button id="start">▶ Iniciar</button><button id="stop">■ Parar</button><button id="buy" class="buy">Enviar COMPRA REAL</button></section>
-<section class="panel"><h2>Melhores oportunidades</h2><div id="progress" class="muted"></div><div id="signals">Nenhum sinal atingiu o score mínimo.</div></section>
-<section class="panel"><h2>Gerenciamento</h2><div class="grid">
-<label>% por entrada<input id="pct" type="number" step=".1"></label><label>Stop Gain da sessão %<input id="sg" type="number" step=".1"></label>
-<label>Stop Loss da sessão %<input id="sl" type="number" step=".1"></label><label>Máx. entradas<input id="maxe" type="number"></label>
-<label>Score mínimo<input id="score" type="number"></label><label>Máx. ativos<input id="maxa" type="number"></label>
-</div>
-<h3>Gerenciamento da operação</h3><div class="grid">
-<label>Take Profit %<input id="tp" type="number" step=".1"></label><label>Stop Loss %<input id="opsl" type="number" step=".1"></label>
-<label>Tempo máximo (segundos)<input id="duration" type="number" min="60" max="1800" step="30"></label>
-<label>Tempo gráfico<select id="tf"><option value="1m">M1</option><option value="5m">M5</option></select></label>
-</div>
-<label class="check"><input id="news" type="checkbox"> Confirmação por notícias / força de mercado</label>
-<label class="check"><input id="newsexit" type="checkbox"> Proteção dinâmica: notícia contrária + preço confirma reversão</label>
-<div class="grid"><label>Força mínima da notícia<input id="newsstrength" type="number" min="1" max="20"></label>
-<label>Confirmação adversa do preço %<input id="newsconfirm" type="number" step=".05" min=".01"></label>
-<label>Checar notícias a cada (s)<input id="newsseconds" type="number" min="30" step="30"></label></div>
-<label class="check"><input id="auto" type="checkbox"> Operação automática REAL</label><button id="save">Salvar gerenciamento</button>
-<p class="muted">Preservado: EMA 10/100 • EMA 3/13 • engolfo • sequência • suporte/resistência 10 candles • tendência macro • M15 • score mínimo.</p></section>
-<section class="panel"><h2>Operação aberta</h2><div id="open">Nenhuma operação aberta.</div></section>
-<section class="panel"><h2>Histórico</h2><div id="history">Sem operações nesta sessão.</div></section><div id="toast"></div>
-</main><script src="/static/app.js?v=pro2"></script></body></html>
+<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#10131a"><link rel="manifest" href="/static/manifest.json"><link rel="stylesheet" href="/static/style.css"><title>Operação Alvo Certo (ATR)</title></head><body><div class="wrap">
+<header><div><h1>Operação Alvo Certo <span>(ATR)</span></h1><p>Somente índices derivados • 110 candles • Confluência M1 + M5 + M15 • Deriv DEMO / REAL</p></div><div id="robotBadge" class="badge off">PARADO</div></header>
+<section class="cards"><article><small>Banca / saldo</small><strong id="balance">—</strong><em id="balanceMode">Selecione uma conta</em></article><article><small>Resultado</small><strong id="pnl">0,00%</strong></article><article><small>Operações</small><strong id="entries">0</strong></article><article><small>Status</small><strong id="status">Parado</strong></article></section>
+<section class="panel account"><h2>Conta Deriv</h2><div id="derivDisconnected"><p class="note">Conecte pela página oficial da Deriv. Sua senha não passa pelo ATR.</p><button class="primary" onclick="location.href='/auth/login'">🔐 Conectar com Deriv</button></div><div id="derivConnected" style="display:none"><label>Conta<select id="derivAccount" onchange="selectDerivAccount()"></select></label><p id="accountMode" class="note">Nenhuma conta selecionada.</p><button onclick="logoutDeriv()">Desconectar</button></div></section>
+<section class="toolbar"><button class="primary" onclick="scan()">🔎 Analisar derivados</button><button onclick="startRobot()">▶ Iniciar</button><button onclick="stopRobot()">■ Parar</button><button class="trade" onclick="derivTrade()">🎯 Operar melhor sinal</button></section>
+<section class="open-panel panel"><div class="panel-title"><h2>Operação aberta</h2><span>Atualização automática</span></div><div id="openTrade" class="empty">Nenhuma operação aberta.</div></section>
+<section class="grid"><article class="panel"><div class="panel-title"><h2>Confluências M1 + M5 + M15</h2><span id="lastScan">—</span></div><div class="strategy-tags"><span>110 candles</span><span>3º toque</span><span>Pernadas A/B/C</span><span>Suporte/Resistência</span><span>Topo/Fundo duplo</span><span>Rompimento + confirmação</span></div><div id="signals" class="signals"><div class="empty">Clique em “Analisar derivados”.</div></div></article>
+<article class="panel"><h2>Gerenciamento</h2><form id="cfg" onsubmit="saveConfig(event)"><label>Banca inicial <input id="banca" type="number" step="0.01" value="1000"></label><label>Entrada (% banca) <input id="percent" type="number" step="0.1" value="1"></label><label>Score mínimo <input id="score" type="number" min="1" max="10" value="7"></label><label>Stop Gain (%) <input id="sg" type="number" step="0.1" value="5"></label><label>Stop Loss (%) <input id="sl" type="number" step="0.1" value="5"></label><label>Máx. entradas <input id="maxe" type="number" value="5"></label><label>Duração (min) <input id="dur" type="number" value="1"></label><button class="primary" type="submit">Salvar configurações</button></form><p class="note"><strong>REAL:</strong> usa dinheiro real. Valide a estratégia em DEMO antes de selecionar uma conta real.</p></article></section>
+<section class="panel news"><div class="panel-title"><h2>Notícias e informações</h2><span>Informativo</span></div><div id="news"><div class="empty">Sem informação de notícias vinculada ao ativo no momento.</div></div><p class="note">Índices derivados/sintéticos não devem ser tratados como se notícias econômicas necessariamente determinassem seu movimento. Este painel é informativo e separado do gatilho técnico.</p></section>
+<section class="panel"><h2>Histórico de operações</h2><div class="history-head"><span>Ativo</span><span>Compra/Venda</span><span>Conta</span><span>Entrada</span><span>Resultado</span><span>P/L</span></div><div id="history" class="history"><div class="empty">Nenhuma operação finalizada.</div></div></section>
+</div><script src="/static/app.js"></script></body></html>
