@@ -1,4 +1,5 @@
 import asyncio, json, os, secrets, hashlib, base64, time, math
+from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from typing import List
 from urllib.parse import urlencode
@@ -8,6 +9,9 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / 'static'
 
 app=FastAPI(title='Operação Alvo Certo ATR - Deriv MTF')
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('SESSION_SECRET',secrets.token_hex(32)),https_only=True,same_site='lax')
@@ -180,6 +184,7 @@ async def analyze_one(a,sem):
 async def scan_once():
     state['status']='Analisando índices derivados M1/M5/M15...'; allsyms=await active_symbols(); syms=[a for a in allsyms if is_derived(a)]
     sem=asyncio.Semaphore(3); results=await asyncio.gather(*[analyze_one(a,sem) for a in syms]); sig=[x for x in results if x];sig.sort(key=lambda x:x.score,reverse=True)
+    sig=[x for x in sig if x.score >= config.min_score]
     state['signals']=[asdict(x) for x in sig[:25]];state['last_scan']=int(time.time());state['status']=f'{len(syms)} índices derivados analisados • M1/M5/M15';state['diagnostics']={'ativos_derivados':len(syms),'sinais':len(sig),'candles_por_tf':110,'timeframes':['M1','M5','M15']}
     return state['signals']
 
@@ -195,7 +200,9 @@ async def get_accounts(request):
     d=await deriv_rest(request,'GET','/trading/v1/options/accounts');return d.get('data',d if isinstance(d,list) else [])
 def account_type(a):return str(a.get('account_type','')).lower()
 @app.get('/')
-async def home():return FileResponse('static/index.html')
+async def home():return FileResponse(STATIC_DIR / 'index.html')
+@app.get('/health')
+async def health():return {'ok':True,'service':'ATR Deriv MTF v2'}
 @app.get('/auth/login')
 async def auth_login(request:Request):
     if not CLIENT_ID:raise HTTPException(500,'Configure DERIV_CLIENT_ID no Render.')
@@ -260,7 +267,13 @@ async def trade_best(request):
     if not aid:raise HTTPException(400,'Selecione a conta Deriv.')
     best=state['signals'][0];accounts=await get_accounts(request);acc=next((a for a in accounts if a.get('account_id')==aid),None)
     if not acc:raise HTTPException(404,'Conta selecionada não está disponível.')
-    balance=float(acc.get('balance',0));state['balance']=balance;stake=round(balance*config.percentual_entrada/100,2)
+    balance=float(acc.get('balance',0));state['balance']=balance
+    start=state.get('start_balance') or balance
+    pnl=((balance-start)/start)*100 if start else 0
+    if pnl >= config.stop_gain: raise HTTPException(409,'Stop Gain atingido.')
+    if pnl <= -config.stop_loss: raise HTTPException(409,'Stop Loss atingido.')
+    if state['entries'] >= config.max_entradas: raise HTTPException(409,'Limite de operações atingido.')
+    stake=round(balance*config.percentual_entrada/100,2)
     if stake<=0:raise HTTPException(400,'Valor da entrada inválido.')
     url=await authenticated_ws_url(request)
     async with websockets.connect(url,ping_interval=20,ping_timeout=20) as ws:
@@ -291,4 +304,4 @@ async def api_scan():return {'signals':await scan_once()}
 async def start():state['running']=True;state['status']='Ativo • índices derivados • M1/M5/M15';return {'ok':True}
 @app.post('/api/stop')
 async def stop():state['running']=False;state['status']='Parado';return {'ok':True}
-app.mount('/static',StaticFiles(directory='static'),name='static')
+app.mount('/static',StaticFiles(directory=str(STATIC_DIR)),name='static')
