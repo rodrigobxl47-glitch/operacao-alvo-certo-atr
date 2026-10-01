@@ -22,7 +22,10 @@ CLIENT_ID=os.getenv('DERIV_CLIENT_ID',''); REDIRECT_URI=os.getenv('DERIV_REDIREC
 class Config(BaseModel):
     banca_inicial:float=1000; percentual_entrada:float=1; stop_gain:float=5; stop_loss:float=5; max_entradas:int=5; min_score:int=7; duracao_minutos:int=1
 class AccountChoice(BaseModel): account_id:str
-config=Config(); state={'running':False,'balance':1000.0,'start_balance':1000.0,'entries':0,'signals':[],'history':[],'open_trade':None,'last_scan':None,'status':'Parado','diagnostics':{},'news':[]}
+config=Config(); state={'running':False,'scanning':False,'balance':1000.0,'start_balance':1000.0,'entries':0,'signals':[],'history':[],'open_trade':None,'last_scan':None,'status':'Parado','diagnostics':{},'news':[]}
+scanner_task = None
+scan_lock = asyncio.Lock()
+
 @dataclass
 class Candle: epoch:int; open:float; high:float; low:float; close:float
 @dataclass
@@ -182,11 +185,49 @@ async def analyze_one(a,sem):
             return analyze(symbol,name,m1,m5,m15)
         except Exception:return None
 async def scan_once():
-    state['status']='Analisando índices derivados M1/M5/M15...'; allsyms=await active_symbols(); syms=[a for a in allsyms if is_derived(a)]
-    sem=asyncio.Semaphore(3); results=await asyncio.gather(*[analyze_one(a,sem) for a in syms]); sig=[x for x in results if x];sig.sort(key=lambda x:x.score,reverse=True)
-    sig=[x for x in sig if x.score >= config.min_score]
-    state['signals']=[asdict(x) for x in sig[:25]];state['last_scan']=int(time.time());state['status']=f'{len(syms)} índices derivados analisados • M1/M5/M15';state['diagnostics']={'ativos_derivados':len(syms),'sinais':len(sig),'candles_por_tf':110,'timeframes':['M1','M5','M15']}
-    return state['signals']
+    if scan_lock.locked():
+        return state['signals']
+    async with scan_lock:
+        state['scanning']=True
+        state['status']='Escaneando índices derivados • M1/M5/M15...'
+        try:
+            allsyms=await active_symbols()
+            syms=[a for a in allsyms if is_derived(a)]
+            sem=asyncio.Semaphore(3)
+            results=await asyncio.gather(*[analyze_one(a,sem) for a in syms])
+            sig=[x for x in results if x]
+            sig.sort(key=lambda x:x.score,reverse=True)
+            sig=[x for x in sig if x.score >= config.min_score]
+            state['signals']=[asdict(x) for x in sig[:25]]
+            state['last_scan']=int(time.time())
+            state['diagnostics']={'ativos_derivados':len(syms),'sinais':len(sig),'candles_por_tf':110,'timeframes':['M1','M5','M15']}
+            state['status']=(f'ATIVO • {len(syms)} derivados analisados • {len(sig)} sinais'
+                             if state['running'] else
+                             f'{len(syms)} derivados analisados • {len(sig)} sinais')
+            print(f"[ATR] Scanner MTF | derivados={len(syms)} | sinais={len(sig)}", flush=True)
+            return state['signals']
+        finally:
+            state['scanning']=False
+
+async def scanner_loop():
+    print('[ATR] Scanner automático iniciado.', flush=True)
+    try:
+        while state['running']:
+            try:
+                await scan_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                state['status']=f'Erro no scanner: {str(e)[:120]}'
+                print(f'[ATR] Erro scanner: {e}', flush=True)
+            for _ in range(15):
+                if not state['running']:
+                    break
+                await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        print('[ATR] Scanner automático parado.', flush=True)
 
 async def deriv_rest(request,method,path):
     token=request.session.get('deriv_token')
@@ -202,7 +243,7 @@ def account_type(a):return str(a.get('account_type','')).lower()
 @app.get('/')
 async def home():return FileResponse(STATIC_DIR / 'index.html')
 @app.get('/health')
-async def health():return {'ok':True,'service':'ATR Deriv MTF v2'}
+async def health():return {'ok':True,'service':'ATR Deriv MTF v3'}
 @app.get('/auth/login')
 async def auth_login(request:Request):
     if not CLIENT_ID:raise HTTPException(500,'Configure DERIV_CLIENT_ID no Render.')
@@ -288,7 +329,8 @@ async def trade_best(request):
     if not cid: raise HTTPException(502,f'Deriv não retornou contract_id: {bd}')
     entry={'time':int(time.time()),'symbol':best['symbol'],'name':best['name'],'direction':best['direction'],'side':'COMPRA' if best['direction']=='CALL' else 'VENDA','score':best['score'],'stake':stake,'result':'ABERTA','mode':typ.upper(),'analysis':best['analysis'],'confirmation':best['confirmation'],'contract_id':cid,'profit':0.0,'duration_minutes':config.duracao_minutos}
     state['open_trade']=dict(entry);state['entries']+=1;state['status']=f"ABERTA • {entry['side']} • {best['name']} • {typ.upper()}"
-    asyncio.create_task(monitor_contract(url,cid,entry))
+    monitor_url=await authenticated_ws_url(request)
+    asyncio.create_task(monitor_contract(monitor_url,cid,entry))
     return {'ok':True,'entry':entry}
 @app.post('/api/deriv/trade')
 async def deriv_trade(request:Request):return await trade_best(request)
@@ -301,7 +343,22 @@ async def set_config(new:Config):
 @app.post('/api/scan')
 async def api_scan():return {'signals':await scan_once()}
 @app.post('/api/start')
-async def start():state['running']=True;state['status']='Ativo • índices derivados • M1/M5/M15';return {'ok':True}
+async def start():
+    global scanner_task
+    if state['running']:
+        return {'ok':True,'message':'Scanner já está ativo.'}
+    state['running']=True
+    state['status']='ATIVO • iniciando scanner M1/M5/M15...'
+    scanner_task=asyncio.create_task(scanner_loop())
+    return {'ok':True}
+
 @app.post('/api/stop')
-async def stop():state['running']=False;state['status']='Parado';return {'ok':True}
+async def stop():
+    global scanner_task
+    state['running']=False
+    state['status']='Parado'
+    if scanner_task and not scanner_task.done():
+        scanner_task.cancel()
+    scanner_task=None
+    return {'ok':True}
 app.mount('/static',StaticFiles(directory=str(STATIC_DIR)),name='static')
