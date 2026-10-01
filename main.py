@@ -18,7 +18,7 @@ CLIENT_ID=os.getenv('DERIV_CLIENT_ID',''); REDIRECT_URI=os.getenv('DERIV_REDIREC
 class Config(BaseModel):
     banca_inicial:float=1000; percentual_entrada:float=1; stop_gain:float=5; stop_loss:float=5; max_entradas:int=5; min_score:int=7; duracao_minutos:int=1
 class AccountChoice(BaseModel): account_id:str
-config=Config(); state={'running':False,'balance':1000.0,'start_balance':1000.0,'entries':0,'signals':[],'history':[],'last_scan':None,'status':'Parado','diagnostics':{}}
+config=Config(); state={'running':False,'balance':1000.0,'start_balance':1000.0,'entries':0,'signals':[],'history':[],'open_trade':None,'last_scan':None,'status':'Parado','diagnostics':{},'news':[]}
 @dataclass
 class Candle: epoch:int; open:float; high:float; low:float; close:float
 @dataclass
@@ -230,14 +230,37 @@ async def authenticated_ws_url(request):
     d=await deriv_rest(request,'POST',f'/trading/v1/options/accounts/{aid}/otp');data=d.get('data',d);url=data.get('url') or data.get('websocket_url')
     if not url:raise HTTPException(502,f'Deriv não retornou URL WebSocket: {d}')
     return url
+async def monitor_contract(url, contract_id, entry):
+    try:
+        async with websockets.connect(url,ping_interval=20,ping_timeout=20) as ws:
+            await ws.send(json.dumps({'proposal_open_contract':1,'contract_id':contract_id,'subscribe':1,'req_id':601}))
+            while True:
+                d=json.loads(await ws.recv())
+                if 'error' in d: raise RuntimeError(d['error'].get('message','Erro ao acompanhar contrato'))
+                poc=d.get('proposal_open_contract') or {}
+                if not poc: continue
+                profit=float(poc.get('profit') or 0); buy_price=float(poc.get('buy_price') or entry['stake'])
+                entry.update({'profit':profit,'buy_price':buy_price,'current_spot':poc.get('current_spot'),'entry_spot':poc.get('entry_spot'),'exit_tick':poc.get('exit_tick'),'is_sold':bool(poc.get('is_sold')),'status':poc.get('status','open')})
+                state['open_trade']=dict(entry)
+                if poc.get('is_sold') or poc.get('status') in ('sold','won','lost'):
+                    result='WIN' if profit>0 else ('LOSS' if profit<0 else 'EMPATE')
+                    entry['result']=result; entry['closed_time']=int(time.time()); entry['side']='COMPRA' if entry['direction']=='CALL' else 'VENDA'
+                    state['history'].insert(0,dict(entry)); state['history']=state['history'][:100]; state['open_trade']=None
+                    state['balance']=round(state['balance']+profit,2); state['status']=f"Finalizada: {result} • {entry['side']} • {entry['name']}"
+                    return
+    except Exception as e:
+        if state.get('open_trade') and state['open_trade'].get('contract_id')==contract_id:
+            state['open_trade']['monitor_error']=str(e); state['status']='Ordem aberta; falha temporária ao acompanhar contrato.'
+
 async def trade_best(request):
+    if state.get('open_trade'): raise HTTPException(409,'Já existe uma operação aberta. Aguarde finalizar.')
     if not state['signals']:await scan_once()
     if not state['signals']:raise HTTPException(400,'Nenhuma confluência M1/M5/M15 confirmada.')
     aid=request.session.get('deriv_account_id');typ=request.session.get('deriv_account_type','')
     if not aid:raise HTTPException(400,'Selecione a conta Deriv.')
     best=state['signals'][0];accounts=await get_accounts(request);acc=next((a for a in accounts if a.get('account_id')==aid),None)
     if not acc:raise HTTPException(404,'Conta selecionada não está disponível.')
-    balance=float(acc.get('balance',0));stake=round(balance*config.percentual_entrada/100,2)
+    balance=float(acc.get('balance',0));state['balance']=balance;stake=round(balance*config.percentual_entrada/100,2)
     if stake<=0:raise HTTPException(400,'Valor da entrada inválido.')
     url=await authenticated_ws_url(request)
     async with websockets.connect(url,ping_interval=20,ping_timeout=20) as ws:
@@ -248,8 +271,12 @@ async def trade_best(request):
         if not pid:raise HTTPException(400,f'Proposta sem ID: {pd}')
         ask=float(prop.get('ask_price',stake));await ws.send(json.dumps({'buy':pid,'price':ask,'req_id':502}));bd=json.loads(await ws.recv())
         if 'error' in bd:raise HTTPException(400,bd['error'].get('message','Erro ao comprar contrato'))
-    entry={'time':int(time.time()),'symbol':best['symbol'],'name':best['name'],'direction':best['direction'],'score':best['score'],'stake':stake,'result':'ENVIADA DERIV','mode':typ.upper(),'analysis':best['analysis'],'confirmation':best['confirmation'],'buy':bd.get('buy',{})}
-    state['history'].insert(0,entry);state['history']=state['history'][:50];state['entries']+=1;state['status']=f"Ordem {typ.upper()} enviada: {best['direction']} {best['name']}";return {'ok':True,'entry':entry,'raw':bd}
+    buy=bd.get('buy',{}); cid=buy.get('contract_id')
+    if not cid: raise HTTPException(502,f'Deriv não retornou contract_id: {bd}')
+    entry={'time':int(time.time()),'symbol':best['symbol'],'name':best['name'],'direction':best['direction'],'side':'COMPRA' if best['direction']=='CALL' else 'VENDA','score':best['score'],'stake':stake,'result':'ABERTA','mode':typ.upper(),'analysis':best['analysis'],'confirmation':best['confirmation'],'contract_id':cid,'profit':0.0,'duration_minutes':config.duracao_minutos}
+    state['open_trade']=dict(entry);state['entries']+=1;state['status']=f"ABERTA • {entry['side']} • {best['name']} • {typ.upper()}"
+    asyncio.create_task(monitor_contract(url,cid,entry))
+    return {'ok':True,'entry':entry}
 @app.post('/api/deriv/trade')
 async def deriv_trade(request:Request):return await trade_best(request)
 @app.get('/api/status')
