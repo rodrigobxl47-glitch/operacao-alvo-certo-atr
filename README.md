@@ -1,31 +1,31 @@
-Operação Alvo Certo (ATR) — aprimorado
-Mantém a interface e a estratégia anterior e acrescenta:
-Take Profit e Stop Loss por operação
-tempo máximo configurável
-seleção M1/M5, mantendo confirmação M15
-resultado líquido e taxas registradas por ordem
-confirmação opcional por notícias (GDELT), usada apenas como filtro de conflito
-correção do cálculo do Stop Gain/Stop Loss da sessão para usar P/L realizado
-fechamento vende somente a quantidade comprada pelo ATR
-Variáveis Render: MB_API_ID, MB_API_SECRET e opcional MB_ACCOUNT_ID. Build: pip install -r requirements.txt Start: uvicorn main:app --host 0.0.0.0 --port $PORT
-IMPORTANTE: ordens são reais. Teste primeiro scanner, saldo e controles. O fechamento por tempo é solicitado ao atingir o tempo configurado; execução real pode ocorrer alguns segundos depois por rede/API/mercado.
-V2:
-histórico ampliado para 160 candles;
-M5 agregado de M1;
-regimes ALTA/BAIXA/LATERAL;
-ABC, 3º toque, pullback/rompimento, engolfo, rejeição, sequência;
-lateral somente nos extremos da faixa com gatilho;
-score mínimo continua configurável.
-V3 inteligente:
-mantém todos os elementos anteriores;
-combo contextual ALTA / BAIXA / LATERAL;
-exige espaço até resistência/suporte antes de aceitar continuação;
-monitor de notícia durante operação;
-saída antecipada por notícia somente quando notícia é contrária, atinge força mínima e o preço confirma movimento adverso;
-TP, SL e tempo máximo continuam como proteções prioritárias. Observação: notícia/tom não prevê mercado e pode conter ruído; por isso não dispara saída isoladamente.
-V4 - volatilidade adaptativa:
-mantém limite de volatilidade como proteção;
-movimento acima do limite não é mais bloqueado automaticamente;
-impulso comprador só passa com ALTA + M15 + ABC/pullback + gatilho + score forte e confluência;
-impulso vendedor é reconhecido de forma simétrica, sem abrir short no mercado à vista;
-movimento esticado ou conflitante continua em AGUARDAR.
+Operação Alvo Certo (ATR)
+PWA Web + backend Python para análise multiativos na Deriv.
+O que esta versão faz
+Descobre automaticamente ativos CALL/PUT via active_symbols.
+Busca candles M1 e M15 via ticks_history.
+Calcula EMA 3, 10, 13 e 100.
+Analisa tendência, engolfo, sequência de candles, suporte/resistência e confirmação M15.
+Cria score de confluência.
+Mostra os melhores sinais em uma interface Web.
+Gerencia percentual da banca, stop gain/loss e limite de entradas.
+Registra entrada em modo DEMO/Paper Trading.
+Importante
+Ela NÃO envia ordem de dinheiro real. A conta DEMO autenticada da API nova da Deriv usa OTP; isso pode ser integrado em uma próxima etapa.
+Rodar no Termux (Android)
+Instale o Termux.
+No terminal: pkg update pkg install python
+Entre na pasta do projeto.
+Instale: pip install -r requirements.txt
+Rode: uvicorn main:app --host 0.0.0.0 --port 8000
+Abra no navegador: http://127.0.0.1:8000
+No computador
+Instale Python 3.11+ e rode: pip install -r requirements.txt uvicorn main:app --host 0.0.0.0 --port 8000
+Instalar como aplicativo
+Abra o endereço no Chrome/Edge e escolha "Adicionar à tela inicial" / "Instalar aplicativo".
+Configuração inicial sugerida
+Banca: 1000
+Entrada: 1%
+Score mínimo: 7
+Stop gain: 5%
+Stop loss: 5%
+Máximo de entradas: 5
