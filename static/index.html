@@ -1,11 +1,141 @@
-<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#10131a"><link rel="manifest" href="/static/manifest.json"><link rel="stylesheet" href="/static/style.css"><title>Operação Alvo Certo (ATR)</title></head><body><div class="wrap">
-<header><div><h1>Operação Alvo Certo <span>(ATR)</span></h1><p>Somente índices derivados • 110 candles • Confluência M1 + M5 + M15 • Deriv DEMO / REAL</p></div><div id="robotBadge" class="badge off">PARADO</div></header>
-<section class="cards"><article><small>Banca / saldo</small><strong id="balance">—</strong><em id="balanceMode">Selecione uma conta</em></article><article><small>Resultado</small><strong id="pnl">0,00%</strong></article><article><small>Operações</small><strong id="entries">0</strong></article><article><small>Status</small><strong id="status">Parado</strong></article></section>
-<section class="panel account"><h2>Conta Deriv</h2><div id="derivDisconnected"><p class="note">Conecte pela página oficial da Deriv. Sua senha não passa pelo ATR.</p><button class="primary" onclick="location.href='/auth/login'">🔐 Conectar com Deriv</button></div><div id="derivConnected" style="display:none"><label>Conta<select id="derivAccount" onchange="selectDerivAccount()"></select></label><p id="accountMode" class="note">Nenhuma conta selecionada.</p><button onclick="logoutDeriv()">Desconectar</button></div></section>
-<section class="toolbar"><button class="primary" onclick="scan()">🔎 Analisar derivados</button><button onclick="startRobot()">▶ Iniciar</button><button onclick="stopRobot()">■ Parar</button><button class="trade" onclick="derivTrade()">🎯 Operar melhor sinal</button></section>
-<section class="open-panel panel"><div class="panel-title"><h2>Operação aberta</h2><span>Atualização automática</span></div><div id="openTrade" class="empty">Nenhuma operação aberta.</div></section>
-<section class="grid"><article class="panel"><div class="panel-title"><h2>Confluências M1 + M5 + M15</h2><span id="lastScan">—</span></div><div class="strategy-tags"><span>110 candles</span><span>3º toque</span><span>Pernadas A/B/C</span><span>Suporte/Resistência</span><span>Topo/Fundo duplo</span><span>Rompimento + confirmação</span></div><div id="signals" class="signals"><div class="empty">Clique em “Analisar derivados”.</div></div></article>
-<article class="panel"><h2>Gerenciamento</h2><form id="cfg" onsubmit="saveConfig(event)"><label>Banca inicial <input id="banca" type="number" step="0.01" value="1000"></label><label>Entrada (% banca) <input id="percent" type="number" step="0.1" value="1"></label><label>Score mínimo <input id="score" type="number" min="1" max="10" value="7"></label><label>Stop Gain (%) <input id="sg" type="number" step="0.1" value="5"></label><label>Stop Loss (%) <input id="sl" type="number" step="0.1" value="5"></label><label>Máx. entradas <input id="maxe" type="number" value="5"></label><label>Duração (min) <input id="dur" type="number" value="1"></label><button class="primary" type="submit">Salvar configurações</button></form><p class="note"><strong>REAL:</strong> usa dinheiro real. Valide a estratégia em DEMO antes de selecionar uma conta real.</p></article></section>
-<section class="panel news"><div class="panel-title"><h2>Notícias e informações</h2><span>Informativo</span></div><div id="news"><div class="empty">Sem informação de notícias vinculada ao ativo no momento.</div></div><p class="note">Índices derivados/sintéticos não devem ser tratados como se notícias econômicas necessariamente determinassem seu movimento. Este painel é informativo e separado do gatilho técnico.</p></section>
-<section class="panel"><h2>Histórico de operações</h2><div class="history-head"><span>Ativo</span><span>Compra/Venda</span><span>Conta</span><span>Entrada</span><span>Resultado</span><span>P/L</span></div><div id="history" class="history"><div class="empty">Nenhuma operação finalizada.</div></div></section>
-</div><script src="/static/app.js"></script></body></html>
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#10131a">
+  <link rel="manifest" href="/static/manifest.json">
+  <link rel="stylesheet" href="/static/style.css">
+  <title>Operação Alvo Certo (ATR)</title>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Operação Alvo Certo <span>(ATR)</span></h1>
+      <p>Análise-base • Suporte/Resistência forte • Tendência • ABC • 3º toque • M1 + M5 + M15</p>
+    </div>
+    <div id="robotBadge" class="badge off">PARADO</div>
+  </header>
+
+  <section class="cards">
+    <article><small>Banca / saldo</small><strong id="balance">—</strong><em id="balanceMode">Selecione uma conta</em></article>
+    <article><small>Resultado</small><strong id="pnl">0,00%</strong></article>
+    <article><small>Operações</small><strong id="entries">0</strong></article>
+    <article><small>Status</small><strong id="status">Parado</strong></article>
+  </section>
+
+  <section class="panel account">
+    <h2>Conta Deriv</h2>
+    <div id="derivDisconnected">
+      <p class="note">Conecte pela página oficial da Deriv. Sua senha não passa pelo ATR.</p>
+      <button class="primary" onclick="location.href='/auth/login'">🔐 Conectar com Deriv</button>
+    </div>
+    <div id="derivConnected" style="display:none">
+      <label>Conta
+        <select id="derivAccount" onchange="selectDerivAccount()"></select>
+      </label>
+      <p id="accountMode" class="note">Nenhuma conta selecionada.</p>
+      <button onclick="logoutDeriv()">Desconectar</button>
+    </div>
+  </section>
+
+  <section class="toolbar">
+    <button class="primary" onclick="scan()">🔎 Analisar derivados</button>
+    <button onclick="startRobot()">▶ Iniciar</button>
+    <button onclick="stopRobot()">■ Parar</button>
+    <button class="trade" onclick="derivTrade()">🎯 Operar melhor sinal</button>
+  </section>
+
+  <section class="open-panel panel">
+    <div class="panel-title"><h2>Operação aberta</h2><span>Atualização automática</span></div>
+    <div id="openTrade" class="empty">Nenhuma operação aberta.</div>
+  </section>
+
+  <section class="grid">
+    <article class="panel">
+      <div class="panel-title">
+        <h2>Análise-base M1 + M5 + M15</h2>
+        <span id="lastScan">—</span>
+      </div>
+      <div class="strategy-tags">
+        <span>110 candles fechados</span>
+        <span>Suporte forte mais baixo</span>
+        <span>Resistência forte mais alta</span>
+        <span>Tendência de alta/baixa</span>
+        <span>Pernadas A/B/C</span>
+        <span>3º toque</span>
+        <span>Candle de confirmação</span>
+      </div>
+      <div id="signals" class="signals"><div class="empty">Clique em “Analisar derivados”.</div></div>
+    </article>
+
+    <article class="panel">
+      <h2>Gerenciamento</h2>
+      <form id="cfg" onsubmit="saveConfig(event)">
+        <label>Banca inicial / saldo da conta
+          <input id="banca" type="number" step="0.01" value="1000" readonly>
+        </label>
+
+        <label>Tipo de entrada
+          <select id="entradaTipo" onchange="syncEntryUI()">
+            <option value="percentual">Percentual da banca (%)</option>
+            <option value="valor">Valor fixo</option>
+          </select>
+        </label>
+
+        <label id="percentWrap">Entrada (% da banca)
+          <input id="percent" type="number" min="0.01" step="0.01" value="1">
+        </label>
+
+        <label id="valorEntradaWrap" style="display:none">Valor fixo da entrada
+          <input id="valorEntrada" type="number" min="0.01" step="0.01" value="1">
+        </label>
+
+        <label style="display:flex;align-items:center;gap:10px">
+          <input id="operacaoAutomatica" type="checkbox" style="width:auto">
+          Operação automática
+        </label>
+        <p id="autoTradeStatus" class="note">Operação automática: DESLIGADA</p>
+
+        <label>Score mínimo
+          <input id="score" type="number" min="1" max="10" value="7">
+        </label>
+        <label>Stop Gain (%)
+          <input id="sg" type="number" min="0.1" step="0.1" value="5">
+        </label>
+        <label>Stop Loss (%)
+          <input id="sl" type="number" min="0.1" step="0.1" value="5">
+        </label>
+        <label>Máx. entradas
+          <input id="maxe" type="number" min="1" value="5">
+        </label>
+        <label>Duração (min)
+          <input id="dur" type="number" min="1" value="1">
+        </label>
+
+        <button class="primary" type="submit">Salvar configurações</button>
+      </form>
+      <p class="note"><strong>AUTO:</strong> quando ligado e o scanner estiver ATIVO, o sistema pode abrir automaticamente o melhor sinal confirmado. Apenas uma operação fica aberta por vez.</p>
+      <p class="note"><strong>REAL:</strong> usa dinheiro real. Valide a estratégia em DEMO antes de selecionar uma conta real.</p>
+    </article>
+  </section>
+
+  <section class="panel news">
+    <div class="panel-title"><h2>Notícias e informações</h2><span>Informativo</span></div>
+    <div id="news"><div class="empty">Sem informação de notícias vinculada ao ativo no momento.</div></div>
+    <p class="note">Índices derivados/sintéticos não devem ser tratados como se notícias econômicas necessariamente determinassem seu movimento. Este painel é informativo e separado do gatilho técnico.</p>
+  </section>
+
+  <section class="panel">
+    <h2>Histórico de operações</h2>
+    <div class="history-head">
+      <span>Ativo</span><span>Compra/Venda</span><span>Conta</span><span>Entrada</span><span>Resultado</span><span>P/L</span>
+    </div>
+    <div id="history" class="history"><div class="empty">Nenhuma operação finalizada.</div></div>
+  </section>
+</div>
+
+<script src="/static/app.js?v=4"></script>
+</body>
+</html>
