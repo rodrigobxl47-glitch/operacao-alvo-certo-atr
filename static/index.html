@@ -41,7 +41,7 @@
   </section>
 
   <section class="toolbar">
-    <button class="primary" onclick="scan()">🔎 Analisar derivados</button>
+    <button class="primary" onclick="scan()">🔎 Analisar Forex</button>
     <button onclick="startRobot()">▶ Iniciar</button>
     <button onclick="stopRobot()">■ Parar</button>
     <button class="trade" onclick="derivTrade()">🎯 Operar melhor combo</button>
@@ -67,7 +67,7 @@
         <span>3º toque</span>
         <span>Confirmação na próxima vela</span><span>Sem score mínimo</span>
       </div>
-      <div id="signals" class="signals"><div class="empty">Clique em “Analisar derivados”.</div></div>
+      <div id="signals" class="signals"><div class="empty">Clique em “Analisar Forex”.</div></div>
     </article>
 
     <article class="panel">
@@ -93,7 +93,7 @@
         </label>
 
         <label style="display:flex;align-items:center;gap:10px">
-          <input id="operacaoAutomatica" type="checkbox" style="width:auto">
+          <input id="operacaoAutomatica" type="checkbox" style="width:auto" checked>
           Operação automática
         </label>
         <p id="autoTradeStatus" class="note">Operação automática: DESLIGADA</p>
@@ -112,7 +112,7 @@
 
         <button class="primary" type="submit">Salvar configurações</button>
       </form>
-      <p class="note"><strong>AUTO:</strong> quando ligado e o scanner estiver ATIVO, o sistema pode abrir automaticamente o melhor sinal confirmado. Apenas uma operação fica aberta por vez.</p>
+      <p class="note"><strong>AUTO:</strong> quando ligado e o scanner estiver ATIVO, o sistema abre automaticamente o melhor sinal confirmado. Apenas uma operação fica aberta por vez.</p>
       <p class="note"><strong>REAL:</strong> usa dinheiro real. Valide a estratégia em DEMO antes de selecionar uma conta real.</p>
     </article>
   </section>
@@ -120,7 +120,7 @@
   <section class="panel news">
     <div class="panel-title"><h2>Notícias e informações</h2><span>Informativo</span></div>
     <div id="news"><div class="empty">Sem informação de notícias vinculada ao ativo no momento.</div></div>
-    <p class="note">Índices derivados/sintéticos não devem ser tratados como se notícias econômicas necessariamente determinassem seu movimento. Este painel é informativo e separado do gatilho técnico.</p>
+    <p class="note">Notícias econômicas são informativas e podem aumentar a volatilidade do Forex. O painel não gera entradas sozinho; o gatilho continua sendo exclusivamente técnico.</p>
   </section>
 
   <section class="panel">
