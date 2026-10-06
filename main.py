@@ -14,7 +14,7 @@ from starlette.middleware.sessions import SessionMiddleware
 BASE_DIR=Path(__file__).resolve().parent
 STATIC_DIR=BASE_DIR/'static'
 
-app=FastAPI(title='Operação Alvo Certo ATR - Deriv MTF v4')
+app=FastAPI(title='Operação Alvo Certo ATR - Deriv MTF v5.1')
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('SESSION_SECRET',secrets.token_hex(32)),https_only=True,same_site='lax')
 
 PUBLIC_WS='wss://api.derivws.com/trading/v1/options/ws/public'
@@ -42,12 +42,22 @@ config=Config()
 state={
     'running':False,'scanning':False,'balance':1000.0,'start_balance':1000.0,
     'entries':0,'signals':[],'history':[],'open_trade':None,'last_scan':None,
-    'status':'Parado','auto_status':'DESLIGADA','diagnostics':{},'news':[],'auto_trade':False
+    'status':'PARADO','auto_status':'DESLIGADA','diagnostics':{},'news':[],
+    'auto_trade':False,'deriv_status':'OK'
 }
 runtime={'token':None,'account_id':None,'account_type':'','currency':'USD','last_auto_signal_key':None}
 scanner_task=None
 scan_lock=asyncio.Lock()
 trade_lock=asyncio.Lock()
+
+# v5.1: uma conexão pública persistente + fila serializada.
+_public_ws=None
+_public_connect_lock=asyncio.Lock()
+_public_request_lock=asyncio.Lock()
+_public_req_id=10000
+_public_backoff_until=0.0
+_active_cache={'time':0.0,'data':[]}
+_candle_cache={}
 
 @dataclass
 class Candle:
@@ -70,7 +80,6 @@ def body_high(c): return max(c.open,c.close)
 def avg_range(cs): return sum(rng(x) for x in cs)/max(len(cs),1)
 def near(a,b,tol): return abs(a-b)<=tol
 
-# Somente os gatilhos solicitados.
 def candle_pattern(cs,side):
     if len(cs)<4:return None
     a,b,c=cs[-1],cs[-2],cs[-3]
@@ -113,13 +122,11 @@ def cluster_levels(points,tol):
         if found:
             found['prices'].append(price);found['indices'].append(idx)
             found['level']=sum(found['prices'])/len(found['prices'])
-        else:
-            groups.append({'level':price,'prices':[price],'indices':[idx]})
+        else:groups.append({'level':price,'prices':[price],'indices':[idx]})
     return groups
 
 def strong_support_resistance(cs):
-    hi,lo=pivots(cs)
-    ar=max(avg_range(cs[-40:]),1e-12);tol=ar*.45
+    hi,lo=pivots(cs);ar=max(avg_range(cs[-40:]),1e-12);tol=ar*.45
     supports=[g for g in cluster_levels(lo,tol) if len(g['prices'])>=2]
     resistances=[g for g in cluster_levels(hi,tol) if len(g['prices'])>=2]
     support=min((g['level'] for g in supports),default=min(x.low for x in cs))
@@ -140,18 +147,16 @@ def abc_confluence(cs,side):
     return hi[-1][1]<hi[-2][1] and lo[-1][1]<lo[-2][1]
 
 def sr_third_touch_previous(cs,side,support,resistance):
-    touch_idx=len(cs)-2; hist=cs[:touch_idx]
-    hi,lo=pivots(hist); pts=lo if side=='CALL' else hi
-    ar=max(avg_range(cs[-30:]),1e-12); tol=ar*.55; level=support if side=='CALL' else resistance
+    touch_idx=len(cs)-2;hist=cs[:touch_idx];hi,lo=pivots(hist);pts=lo if side=='CALL' else hi
+    ar=max(avg_range(cs[-30:]),1e-12);tol=ar*.55;level=support if side=='CALL' else resistance
     prior=sum(1 for _,p in pts if near(p,level,tol))
     touch=cs[touch_idx].low if side=='CALL' else cs[touch_idx].high
     return prior>=2 and near(touch,level,ar*.75)
 
 def trend_third_touch_previous(cs,side):
-    touch_idx=len(cs)-2; base=cs[:touch_idx]
-    hi,lo=pivots(base); pts=(lo if side=='CALL' else hi)[-5:]
+    touch_idx=len(cs)-2;base=cs[:touch_idx];hi,lo=pivots(base);pts=(lo if side=='CALL' else hi)[-5:]
     if len(pts)<2:return False
-    ar=max(avg_range(cs[-30:]),1e-12); tol=ar*.8
+    ar=max(avg_range(cs[-30:]),1e-12);tol=ar*.8
     for j in range(len(pts)-1,0,-1):
         i1,p1=pts[j-1];i2,p2=pts[j]
         if i2==i1:continue
@@ -166,7 +171,7 @@ def trend_third_touch_previous(cs,side):
 def analyze(symbol,name,m1,m5,m15):
     if min(len(m1),len(m5),len(m15))<110:return None
     m1,m5,m15=m1[-110:],m5[-110:],m15[-110:]
-    support,resistance=strong_support_resistance(m1); candidates=[]
+    support,resistance=strong_support_resistance(m1);candidates=[]
     for side in ('CALL','PUT'):
         pat=candle_pattern(m1,side)
         if not pat:continue
@@ -185,17 +190,70 @@ def analyze(symbol,name,m1,m5,m15):
     _,side,combo,analysis,reasons,pat,touch_epoch,signal_epoch=max(candidates,key=lambda z:z[0])
     return Signal(symbol,name,side,m1[-1].close,analysis,pat,combo,reasons,support,resistance,['M1','M5','M15'],signal_epoch,touch_epoch)
 
-async def ws_public(payload,req_id=1):
-    async with websockets.connect(PUBLIC_WS,ping_interval=20,ping_timeout=20,open_timeout=15) as ws:
-        p=dict(payload);p['req_id']=req_id;await ws.send(json.dumps(p))
-        while True:
-            d=json.loads(await ws.recv())
-            if d.get('req_id')==req_id:
-                if 'error' in d:raise RuntimeError(d['error'].get('message','Erro Deriv'))
-                return d
+def is_429(e):
+    s=str(e).lower()
+    return '429' in s or 'too many' in s or 'rate limit' in s
+
+async def close_public_ws():
+    global _public_ws
+    if _public_ws is not None:
+        try:await _public_ws.close()
+        except Exception:pass
+    _public_ws=None
+
+async def ensure_public_ws():
+    global _public_ws,_public_backoff_until
+    delay=_public_backoff_until-time.monotonic()
+    if delay>0:
+        state['deriv_status']=f'LIMITADA 429 • aguardando {int(delay)+1}s'
+        await asyncio.sleep(delay)
+    async with _public_connect_lock:
+        if _public_ws is not None:
+            return _public_ws
+        try:
+            _public_ws=await websockets.connect(PUBLIC_WS,ping_interval=25,ping_timeout=20,open_timeout=15,close_timeout=5,max_queue=64)
+            state['deriv_status']='OK'
+            return _public_ws
+        except Exception:
+            _public_ws=None
+            raise
+
+async def ws_public(payload,req_id=None):
+    global _public_req_id,_public_backoff_until
+    async with _public_request_lock:
+        last=None
+        for attempt in range(4):
+            try:
+                ws=await ensure_public_ws()
+                _public_req_id+=1;rid=_public_req_id
+                p=dict(payload);p['req_id']=rid
+                await ws.send(json.dumps(p))
+                while True:
+                    d=json.loads(await asyncio.wait_for(ws.recv(),timeout=25))
+                    if d.get('req_id')!=rid:continue
+                    if 'error' in d:raise RuntimeError(d['error'].get('message','Erro Deriv'))
+                    state['deriv_status']='OK'
+                    await asyncio.sleep(.12)
+                    return d
+            except asyncio.CancelledError:raise
+            except Exception as e:
+                last=e;await close_public_ws()
+                if is_429(e):
+                    wait=min(5*(2**attempt),40)
+                    _public_backoff_until=time.monotonic()+wait
+                    state['deriv_status']=f'LIMITADA 429 • aguardando {wait}s'
+                    if config.operacao_automatica:state['auto_status']=f'AGUARDANDO DERIV • 429 • {wait}s'
+                    await asyncio.sleep(wait)
+                else:
+                    await asyncio.sleep(min(1+attempt,4))
+        raise RuntimeError(f'Deriv indisponível: {last}')
 
 async def active_symbols():
-    return (await ws_public({'active_symbols':'brief','contract_type':['CALL','PUT']},100)).get('active_symbols',[])
+    now=time.monotonic()
+    if _active_cache['data'] and now-_active_cache['time']<1800:return _active_cache['data']
+    data=(await ws_public({'active_symbols':'brief','contract_type':['CALL','PUT']})).get('active_symbols',[])
+    _active_cache.update({'time':now,'data':data})
+    return data
 
 def sym_fields(a):
     return a.get('underlying_symbol') or a.get('symbol'),a.get('underlying_symbol_name') or a.get('display_name') or a.get('underlying_symbol') or a.get('symbol')
@@ -205,22 +263,28 @@ def is_derived(a):
     return any(k in vals for k in ('synthetic','derived','volatility','crash','boom','jump','step','range break','drift switch','daily reset','dex'))
 
 async def candles(symbol,granularity,count=111):
-    d=await ws_public({'ticks_history':symbol,'adjust_start_time':1,'count':count,'end':'latest','granularity':granularity,'style':'candles'},1000+granularity)
+    # Evita repetir a mesma consulta dentro do mesmo candle fechado.
+    bucket=(int(time.time())-2)//granularity
+    key=(symbol,granularity)
+    cached=_candle_cache.get(key)
+    if cached and cached[0]==bucket:return cached[1]
+    d=await ws_public({'ticks_history':symbol,'adjust_start_time':1,'count':count,'end':'latest','granularity':granularity,'style':'candles'})
     out=[];now=int(time.time())
     for c in d.get('candles',[]):
         try:
             x=Candle(int(c['epoch']),float(c['open']),float(c['high']),float(c['low']),float(c['close']))
             if x.epoch+granularity<=now:out.append(x)
         except Exception:pass
-    return out[-110:]
+    out=out[-110:];_candle_cache[key]=(bucket,out)
+    return out
 
 async def analyze_one(a,sem):
     async with sem:
         symbol,name=sym_fields(a)
         if not symbol:return None
         try:
-            m1=await candles(symbol,60);await asyncio.sleep(.08)
-            m5=await candles(symbol,300);await asyncio.sleep(.08)
+            m1=await candles(symbol,60)
+            m5=await candles(symbol,300)
             m15=await candles(symbol,900)
             return analyze(symbol,name,m1,m5,m15)
         except Exception as e:
@@ -229,21 +293,24 @@ async def analyze_one(a,sem):
 async def scan_once():
     if scan_lock.locked():return state['signals']
     async with scan_lock:
-        state['scanning']=True;state['status']='ESCANEANDO • tendência • suporte/resistência • ABC • 3º toque'
+        state['scanning']=True;state['status']='ESCANEANDO'
         try:
             syms=[a for a in await active_symbols() if is_derived(a)]
-            sem=asyncio.Semaphore(3)
-            results=await asyncio.gather(*[analyze_one(a,sem) for a in syms])
-            sig=[x for x in results if x]
-            sig.sort(key=lambda x:x.signal_epoch,reverse=True)
+            # Uma fila controlada: evita rajada de conexões/requisições.
+            sem=asyncio.Semaphore(1)
+            results=[]
+            for a in syms:
+                results.append(await analyze_one(a,sem))
+            sig=[x for x in results if x];sig.sort(key=lambda x:x.signal_epoch,reverse=True)
             state['signals']=[asdict(x) for x in sig[:25]]
             state['last_scan']=int(time.time())
-            state['diagnostics']={'ativos_derivados':len(syms),'sinais':len(sig),'candles_por_tf':110,'timeframes':['M1','M5','M15'],'base':'Suporte forte + Resistência forte + Tendência','confluencias':['ABC','3º toque tendência','3º toque suporte/resistência']}
-            if state['open_trade']:state['status']=f"OPERAÇÃO ABERTA • {state['open_trade']['side']} • {state['open_trade']['name']}"
-            elif state['running']:state['status']=f"ATIVO • {len(syms)} derivados • {len(sig)} sinais"
-            else:state['status']=f"{len(syms)} derivados analisados • {len(sig)} sinais"
+            state['diagnostics']={'ativos_derivados':len(syms),'sinais':len(sig),'candles_por_tf':110,'timeframes':['M1','M5','M15'],'base':'Combos independentes','confluencias':['ABC','3º toque tendência','3º toque suporte/resistência']}
             return state['signals']
-        finally:state['scanning']=False
+        finally:
+            state['scanning']=False
+            if state['open_trade']:state['status']='OPERAÇÃO ABERTA'
+            elif state['running']:state['status']='ATIVO'
+            else:state['status']='PARADO'
 
 def auth_headers(token):
     h={'Authorization':f'Bearer {token}'}
@@ -279,49 +346,77 @@ async def refresh_runtime_balance():
     accounts=await get_accounts_token(runtime['token'])
     acc=next((a for a in accounts if a.get('account_id')==runtime['account_id']),None)
     if acc:
-        state['balance']=float(acc.get('balance',state['balance']))
-        runtime['currency']=acc.get('currency',runtime['currency'])
+        state['balance']=float(acc.get('balance',state['balance']));runtime['currency']=acc.get('currency',runtime['currency'])
     return acc
 
 def calculate_stake(balance):
-    if config.entrada_tipo.lower()=='valor':stake=config.valor_entrada
-    else:stake=balance*config.percentual_entrada/100
+    stake=config.valor_entrada if config.entrada_tipo.lower()=='valor' else balance*config.percentual_entrada/100
     return round(float(stake),2)
+
+def signal_fresh(best):
+    # signal_epoch é o início da vela M1 confirmadora.
+    # Após o fechamento, aceita no máximo ~45 s para não entrar atrasado.
+    ep=int(best.get('signal_epoch') or 0)
+    return bool(ep) and time.time()<=ep+105
+
+async def trade_ws_connect(token,account_id,best=None,automatic=False):
+    last=None
+    for attempt in range(3):
+        if automatic and best and not signal_fresh(best):
+            raise HTTPException(409,'Sinal expirou enquanto aguardava a Deriv. Aguardando novo combo.')
+        try:
+            url=await otp_url_token(token,account_id)
+            return await websockets.connect(url,ping_interval=20,ping_timeout=20,open_timeout=15)
+        except HTTPException as e:
+            last=e
+            if e.status_code!=429:raise
+        except Exception as e:
+            last=e
+            if not is_429(e):raise
+        wait=5*(attempt+1)
+        state['deriv_status']=f'LIMITADA 429 • ordem aguardando {wait}s'
+        if automatic:state['auto_status']=f'AGUARDANDO DERIV • 429 • {wait}s'
+        await asyncio.sleep(wait)
+    raise HTTPException(429,f'Deriv limitou as conexões. {last}')
 
 async def monitor_contract(token,account_id,contract_id,entry):
     attempts=0
     while attempts<8:
+        ws=None
         try:
             url=await otp_url_token(token,account_id)
-            async with websockets.connect(url,ping_interval=20,ping_timeout=20) as ws:
-                await ws.send(json.dumps({'proposal_open_contract':1,'contract_id':contract_id,'subscribe':1,'req_id':601}))
-                while True:
-                    d=json.loads(await asyncio.wait_for(ws.recv(),timeout=45))
-                    if 'error' in d:raise RuntimeError(d['error'].get('message','Erro ao acompanhar contrato'))
-                    poc=d.get('proposal_open_contract') or {}
-                    if not poc:continue
-                    profit=float(poc.get('profit') or 0)
-                    entry.update({'profit':profit,'buy_price':float(poc.get('buy_price') or entry['stake']),'current_spot':poc.get('current_spot'),'entry_spot':poc.get('entry_spot'),'exit_tick':poc.get('exit_tick'),'is_sold':bool(poc.get('is_sold')),'status':poc.get('status','open')})
-                    state['open_trade']=dict(entry)
-                    state['status']=f"OPERAÇÃO ABERTA • {entry['side']} • {entry['name']}"
-                    closed=bool(poc.get('is_sold')) or poc.get('status') in ('sold','won','lost') or poc.get('is_expired')==1
-                    if closed:
-                        result='WIN' if profit>0 else ('LOSS' if profit<0 else 'EMPATE')
-                        entry['result']=result;entry['closed_time']=int(time.time());entry['status']='finalizada'
-                        state['history'].insert(0,dict(entry));state['history']=state['history'][:100];state['open_trade']=None
-                        try:await refresh_runtime_balance()
-                        except Exception:state['balance']=round(state['balance']+profit,2)
-                        state['status']=(f"ATIVO • última: {result} • {entry['side']} • {entry['name']}" if state['running'] else f"Finalizada: {result} • {entry['side']} • {entry['name']}")
-                        return
+            ws=await websockets.connect(url,ping_interval=20,ping_timeout=20,open_timeout=15)
+            await ws.send(json.dumps({'proposal_open_contract':1,'contract_id':contract_id,'subscribe':1,'req_id':601}))
+            while True:
+                d=json.loads(await asyncio.wait_for(ws.recv(),timeout=45))
+                if 'error' in d:raise RuntimeError(d['error'].get('message','Erro ao acompanhar contrato'))
+                poc=d.get('proposal_open_contract') or {}
+                if not poc:continue
+                profit=float(poc.get('profit') or 0)
+                entry.update({'profit':profit,'buy_price':float(poc.get('buy_price') or entry['stake']),'current_spot':poc.get('current_spot'),'entry_spot':poc.get('entry_spot'),'exit_tick':poc.get('exit_tick'),'is_sold':bool(poc.get('is_sold')),'status':poc.get('status','open')})
+                state['open_trade']=dict(entry);state['status']='OPERAÇÃO ABERTA'
+                closed=bool(poc.get('is_sold')) or poc.get('status') in ('sold','won','lost') or poc.get('is_expired')==1
+                if closed:
+                    result='WIN' if profit>0 else ('LOSS' if profit<0 else 'EMPATE')
+                    entry['result']=result;entry['closed_time']=int(time.time());entry['status']='finalizada'
+                    state['history'].insert(0,dict(entry));state['history']=state['history'][:100];state['open_trade']=None
+                    try:await refresh_runtime_balance()
+                    except Exception:state['balance']=round(state['balance']+profit,2)
+                    state['status']='ATIVO' if state['running'] else 'PARADO'
+                    return
         except asyncio.CancelledError:raise
         except Exception as e:
             attempts+=1
             if state.get('open_trade') and state['open_trade'].get('contract_id')==contract_id:
-                state['open_trade']['monitor_error']=str(e);state['status']=f'OPERAÇÃO ABERTA • reconectando monitor ({attempts}/8)'
-            await asyncio.sleep(min(2*attempts,10))
+                state['open_trade']['monitor_error']=str(e);state['status']='OPERAÇÃO ABERTA'
+            await asyncio.sleep(min(5*attempts if is_429(e) else 2*attempts,30))
+        finally:
+            if ws is not None:
+                try:await ws.close()
+                except Exception:pass
     if state.get('open_trade') and state['open_trade'].get('contract_id')==contract_id:
         state['open_trade']['monitor_error']='Não foi possível confirmar o encerramento automaticamente.'
-        state['status']='Operação pendente de confirmação da Deriv.'
+        state['status']='OPERAÇÃO ABERTA'
 
 async def execute_best_trade(token=None,account_id=None,account_typ=None,automatic=False):
     async with trade_lock:
@@ -329,7 +424,9 @@ async def execute_best_trade(token=None,account_id=None,account_typ=None,automat
         if not state['signals']:raise HTTPException(400,'Nenhum sinal confirmado disponível.')
         token=token or runtime['token'];account_id=account_id or runtime['account_id'];account_typ=account_typ or runtime['account_type']
         if not token or not account_id:raise HTTPException(401,'Conecte a Deriv e selecione uma conta.')
-        best=state['signals'][0];signal_key=f"{best['symbol']}:{best['direction']}:{best.get('signal_epoch',0)}:{best.get('combo','')}"
+        best=state['signals'][0]
+        if automatic and not signal_fresh(best):raise HTTPException(409,'Sinal expirado. Aguardando novo combo.')
+        signal_key=f"{best['symbol']}:{best['direction']}:{best.get('signal_epoch',0)}:{best.get('combo','')}"
         if automatic and runtime['last_auto_signal_key']==signal_key:return {'ok':False,'skipped':'Sinal já operado neste candle.'}
         accounts=await get_accounts_token(token);acc=next((a for a in accounts if a.get('account_id')==account_id),None)
         if not acc:raise HTTPException(404,'Conta selecionada não está disponível.')
@@ -341,20 +438,26 @@ async def execute_best_trade(token=None,account_id=None,account_typ=None,automat
         stake=calculate_stake(balance)
         if stake<=0:raise HTTPException(400,'Valor da entrada inválido.')
         if stake>balance:raise HTTPException(400,'Valor da entrada é maior que a banca.')
-        url=await otp_url_token(token,account_id)
-        async with websockets.connect(url,ping_interval=20,ping_timeout=20) as ws:
+
+        ws=await trade_ws_connect(token,account_id,best,automatic)
+        try:
             proposal={'proposal':1,'amount':stake,'basis':'stake','contract_type':best['direction'],'currency':acc.get('currency','USD'),'duration':config.duracao_minutos,'duration_unit':'m','underlying_symbol':best['symbol'],'req_id':501}
             await ws.send(json.dumps(proposal));pd=json.loads(await ws.recv())
             if 'error' in pd:raise HTTPException(400,pd['error'].get('message','Erro na proposta'))
             prop=pd.get('proposal',{});pid=prop.get('id')
             if not pid:raise HTTPException(400,f'Proposta sem ID: {pd}')
+            if automatic and not signal_fresh(best):raise HTTPException(409,'Sinal expirou antes da compra.')
             ask=float(prop.get('ask_price',stake))
             await ws.send(json.dumps({'buy':pid,'price':ask,'req_id':502}));bd=json.loads(await ws.recv())
             if 'error' in bd:raise HTTPException(400,bd['error'].get('message','Erro ao comprar contrato'))
+        finally:
+            try:await ws.close()
+            except Exception:pass
+
         buy=bd.get('buy',{});cid=buy.get('contract_id')
         if not cid:raise HTTPException(502,f'Deriv não retornou contract_id: {bd}')
         entry={'time':int(time.time()),'symbol':best['symbol'],'name':best['name'],'direction':best['direction'],'side':'COMPRA' if best['direction']=='CALL' else 'VENDA','combo':best.get('combo',''),'touch_epoch':best.get('touch_epoch',0),'stake':stake,'result':'ABERTA','mode':str(account_typ).upper(),'automatic':bool(automatic),'analysis':best['analysis'],'confirmation':best['confirmation'],'contract_id':cid,'profit':0.0,'duration_minutes':config.duracao_minutos,'signal_epoch':best.get('signal_epoch',0)}
-        state['open_trade']=dict(entry);state['entries']+=1;state['status']=f"OPERAÇÃO ABERTA • {entry['side']} • {best['name']} • {entry['mode']}"
+        state['open_trade']=dict(entry);state['entries']+=1;state['status']='OPERAÇÃO ABERTA'
         runtime['last_auto_signal_key']=signal_key
         asyncio.create_task(monitor_contract(token,account_id,cid,entry))
         return {'ok':True,'entry':entry}
@@ -368,30 +471,50 @@ async def maybe_auto_trade():
         state['auto_status']='AGUARDANDO COMBO';return
     if not runtime['token'] or not runtime['account_id']:
         state['auto_status']='BLOQUEADO • selecione uma conta Deriv';return
+    if not signal_fresh(state['signals'][0]):
+        state['auto_status']='SINAL EXPIRADO • AGUARDANDO NOVO COMBO';return
     try:
         state['auto_status']='COMBO CONFIRMADO • ENVIANDO ORDEM'
         r=await execute_best_trade(automatic=True)
         state['auto_status']='OPERAÇÃO ABERTA' if r.get('ok') else 'AGUARDANDO NOVO COMBO'
-    except HTTPException as e:state['auto_status']=f'BLOQUEADO • {e.detail}'
-    except Exception as e:state['auto_status']=f'ERRO • {str(e)[:100]}'
+    except HTTPException as e:
+        if e.status_code==429:state['auto_status']='AGUARDANDO DERIV • limite 429'
+        else:state['auto_status']=f'BLOQUEADO • {e.detail}'
+    except Exception as e:
+        state['auto_status']=('AGUARDANDO DERIV • limite 429' if is_429(e) else f'ERRO TEMPORÁRIO • {str(e)[:90]}')
 
 async def scanner_loop():
     try:
         while state['running']:
             try:
-                await scan_once();await maybe_auto_trade()
+                await scan_once()
+                if state['running'] and not state['open_trade']:state['status']='ATIVO'
+                await maybe_auto_trade()
             except asyncio.CancelledError:raise
-            except Exception as e:state['status']=f'Erro no scanner: {str(e)[:120]}'
-            for _ in range(15):
-                if not state['running']:break
-                await asyncio.sleep(1)
+            except Exception as e:
+                if state['running']:state['status']='ATIVO'
+                if is_429(e):state['deriv_status']='LIMITADA 429'
+            if not state['running']:break
+            # Como a entrada depende de vela M1 fechada, próxima varredura no
+            # próximo minuto + 2 s. Isso reduz drasticamente o risco de 429.
+            now=time.time();next_run=(int(now)//60+1)*60+2
+            while state['running'] and time.time()<next_run:
+                await asyncio.sleep(min(1,max(.1,next_run-time.time())))
     except asyncio.CancelledError:pass
+    finally:
+        if not state['running'] and not state['open_trade']:state['status']='PARADO'
+
+def current_display_status():
+    if state.get('open_trade'):return 'OPERAÇÃO ABERTA'
+    if state.get('scanning'):return 'ESCANEANDO'
+    if state.get('running'):return 'ATIVO'
+    return 'PARADO'
 
 @app.get('/')
 async def home():return FileResponse(STATIC_DIR/'index.html')
 
 @app.get('/health')
-async def health():return {'ok':True,'service':'ATR Deriv MTF v4','running':state['running'],'scanning':state['scanning']}
+async def health():return {'ok':True,'service':'ATR Deriv MTF v5.1','running':state['running'],'scanning':state['scanning'],'deriv_status':state['deriv_status']}
 
 @app.get('/auth/login')
 async def auth_login(request:Request):
@@ -449,7 +572,7 @@ async def deriv_trade(request:Request):
 @app.get('/api/status')
 async def get_status():
     start=state['start_balance'];pnl=((state['balance']-start)/start)*100 if start else 0
-    display='OPERAÇÃO ABERTA' if state['open_trade'] else ('ESCANEANDO' if state['scanning'] else ('ATIVO' if state['running'] else 'PARADO'))
+    display=current_display_status()
     return {**state,'status':display,'display_status':display,'config':config.model_dump(),'pnl_percent':round(pnl,2),'account_selected':bool(runtime['account_id']),'account_type':runtime['account_type'],'currency':runtime['currency']}
 
 @app.post('/api/config')
@@ -469,15 +592,19 @@ async def api_scan():return {'signals':await scan_once()}
 async def start():
     global scanner_task
     if state['running'] and scanner_task and not scanner_task.done():return {'ok':True,'message':'Scanner já está ativo.'}
-    state['running']=True;state['auto_trade']=config.operacao_automatica;state['status']='ATIVO • iniciando análise-base...'
+    state['running']=True;state['auto_trade']=config.operacao_automatica;state['status']='ATIVO'
+    state['auto_status']='AGUARDANDO COMBO' if config.operacao_automatica else 'DESLIGADA'
     scanner_task=asyncio.create_task(scanner_loop());return {'ok':True}
 
 @app.post('/api/stop')
 async def stop():
     global scanner_task
     state['running']=False
-    state['status']=f"OPERAÇÃO ABERTA • {state['open_trade']['side']} • monitorando" if state['open_trade'] else 'Parado'
+    state['status']='OPERAÇÃO ABERTA' if state['open_trade'] else 'PARADO'
+    state['auto_status']='LIGADA • scanner parado' if config.operacao_automatica else 'DESLIGADA'
     if scanner_task and not scanner_task.done():scanner_task.cancel()
-    scanner_task=None;return {'ok':True}
+    scanner_task=None
+    await close_public_ws()
+    return {'ok':True}
 
 app.mount('/static',StaticFiles(directory=str(STATIC_DIR)),name='static')
