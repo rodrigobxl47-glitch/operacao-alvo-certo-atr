@@ -29,9 +29,11 @@ async function refresh(){
   pnl.textContent=`${Number(s.pnl_percent||0).toFixed(2)}%`;
   entries.textContent=s.entries||0;
   const displayStatus=s.open_trade?'OPERAÇÃO ABERTA':(s.scanning?'ESCANEANDO':(s.running?'ATIVO':'PARADO'));
-  status.textContent=displayStatus;
-  robotBadge.textContent=displayStatus;
-  robotBadge.className='badge '+((s.running||s.scanning||s.open_trade)?'on':'off');
+  const statusEl=document.getElementById('status');
+  const badgeEl=document.getElementById('robotBadge');
+  if(statusEl)statusEl.textContent=displayStatus;
+  if(badgeEl)badgeEl.textContent=displayStatus;
+  if(badgeEl)badgeEl.className='badge '+((s.running||s.scanning||s.open_trade)?'on':'off');
 
   renderSignals(s.signals||[]);
   renderHistory(s.history||[]);
