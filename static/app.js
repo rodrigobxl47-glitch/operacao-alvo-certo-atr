@@ -28,9 +28,9 @@ async function refresh(){
   balance.textContent=money(s.balance,accountCurrency);
   pnl.textContent=`${Number(s.pnl_percent||0).toFixed(2)}%`;
   entries.textContent=s.entries||0;
-  status.textContent=s.status||'—';
-
-  robotBadge.textContent=s.scanning?'ESCANEANDO':(s.open_trade?'OPERANDO':(s.running?'ATIVO':'PARADO'));
+  const displayStatus=s.open_trade?'OPERAÇÃO ABERTA':(s.scanning?'ESCANEANDO':(s.running?'ATIVO':'PARADO'));
+  status.textContent=displayStatus;
+  robotBadge.textContent=displayStatus;
   robotBadge.className='badge '+((s.running||s.scanning||s.open_trade)?'on':'off');
 
   renderSignals(s.signals||[]);
@@ -49,26 +49,25 @@ async function refresh(){
   setVal(['sg'],c.stop_gain??5);
   setVal(['sl'],c.stop_loss??5);
   setVal(['maxe'],c.max_entradas??5);
-  setVal(['score'],c.min_score??7);
   setVal(['dur'],c.duracao_minutos??1);
   setChecked(['operacaoAutomatica','autoTrade'],c.operacao_automatica);
   syncEntryUI();
 
   const autoLabel=get('autoTradeStatus');
-  if(autoLabel)autoLabel.textContent=c.operacao_automatica?'Operação automática: LIGADA':'Operação automática: DESLIGADA';
+  if(autoLabel)autoLabel.textContent='Operação automática: '+(s.auto_status||(c.operacao_automatica?'LIGADA':'DESLIGADA'));
  }catch(e){status.textContent='Falha de atualização: '+e.message}
 }
 
 function renderSignals(items){
  if(!items.length){signals.innerHTML='<div class="empty">Nenhum sinal confirmado pela análise-base.</div>';return}
- signals.innerHTML=items.map((x,i)=>`<div class="signal"><div><div class="symbol">${i===0?'🎯 ':''}${x.name} <span class="${x.direction==='CALL'?'call':'put'}">${x.direction==='CALL'?'▲ COMPRA':'▼ VENDA'}</span></div><div class="meta">${x.symbol} • preço ${x.price} • 110 candles fechados em M1/M5/M15</div><div class="meta"><strong>${x.analysis||''}</strong> • Gatilho: ${x.confirmation||''}</div><div class="meta">Suporte forte ${Number(x.support||0).toFixed(5)} • Resistência forte ${Number(x.resistance||0).toFixed(5)}</div><div class="reasons">${(x.reasons||[]).join(' • ')}</div></div><div class="score">${x.score}/10</div></div>`).join('')
+ signals.innerHTML=items.map((x,i)=>`<div class="signal"><div><div class="symbol">${i===0?'🎯 ':''}${x.name} <span class="${x.direction==='CALL'?'call':'put'}">${x.direction==='CALL'?'▲ COMPRA':'▼ VENDA'}</span></div><div class="meta">${x.symbol} • preço ${x.price} • 110 candles fechados em M1/M5/M15</div><div class="meta"><strong>${x.combo||'COMBO'}</strong> • ${x.analysis||''} • Confirmação: ${x.confirmation||''}</div><div class="meta">Suporte forte ${Number(x.support||0).toFixed(5)} • Resistência forte ${Number(x.resistance||0).toFixed(5)}</div><div class="reasons">${(x.reasons||[]).join(' • ')}</div></div></div>`).join('')
 }
 
 function renderOpen(x){
  if(!x){openTrade.className='empty';openTrade.innerHTML='Nenhuma operação aberta.';return}
  const elapsed=Math.max(0,Math.floor(Date.now()/1000-Number(x.time||0))),total=Number(x.duration_minutes||1)*60,left=Math.max(0,total-elapsed);
  openTrade.className='open-trade';
- openTrade.innerHTML=`<div><small>ATIVO</small><strong>${x.name}</strong><span>${x.symbol}</span></div><div><small>DIREÇÃO</small><strong class="${x.direction==='CALL'?'call':'put'}">${x.side||(x.direction==='CALL'?'COMPRA':'VENDA')}</strong><span>${x.mode||''}${x.automatic?' • AUTO':' • MANUAL'}</span></div><div><small>VALOR</small><strong>${money(x.stake,accountCurrency)}</strong><span>Score ${x.score}</span></div><div><small>P/L ATUAL</small><strong class="${Number(x.profit)>=0?'call':'put'}">${money(x.profit,accountCurrency)}</strong><span>${x.status||'open'}</span></div><div><small>TEMPO</small><strong>${Math.floor(left/60)}:${String(left%60).padStart(2,'0')}</strong><span>${x.confirmation||''}</span></div>`
+ openTrade.innerHTML=`<div><small>ATIVO</small><strong>${x.name}</strong><span>${x.symbol}</span></div><div><small>DIREÇÃO</small><strong class="${x.direction==='CALL'?'call':'put'}">${x.side||(x.direction==='CALL'?'COMPRA':'VENDA')}</strong><span>${x.mode||''}${x.automatic?' • AUTO':' • MANUAL'}</span></div><div><small>VALOR</small><strong>${money(x.stake,accountCurrency)}</strong><span>${x.combo||''}</span></div><div><small>P/L ATUAL</small><strong class="${Number(x.profit)>=0?'call':'put'}">${money(x.profit,accountCurrency)}</strong><span>${x.status||'open'}</span></div><div><small>TEMPO</small><strong>${Math.floor(left/60)}:${String(left%60).padStart(2,'0')}</strong><span>${x.confirmation||''}</span></div>`
 }
 
 function renderHistory(items){
@@ -150,7 +149,6 @@ async function saveConfig(e,showMessage=true){
    stop_gain:+valueOf(['sg'],lastConfig?.stop_gain||5),
    stop_loss:+valueOf(['sl'],lastConfig?.stop_loss||5),
    max_entradas:+valueOf(['maxe'],lastConfig?.max_entradas||5),
-   min_score:+valueOf(['score'],lastConfig?.min_score||7),
    duracao_minutos:+valueOf(['dur'],lastConfig?.duracao_minutos||1)
   };
   await api('/api/config',{method:'POST',body:JSON.stringify(payload)});
