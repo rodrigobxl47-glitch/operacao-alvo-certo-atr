@@ -13,7 +13,7 @@
   <header>
     <div>
       <h1>Operação Alvo Certo <span>(ATR)</span></h1>
-      <p>Análise-base • Suporte/Resistência forte • Tendência • ABC • 3º toque • M1 + M5 + M15</p>
+      <p>Combos • Suporte/Resistência forte • Tendência + ABC • 3º toque • próxima vela confirma</p>
     </div>
     <div id="robotBadge" class="badge off">PARADO</div>
   </header>
@@ -44,7 +44,7 @@
     <button class="primary" onclick="scan()">🔎 Analisar derivados</button>
     <button onclick="startRobot()">▶ Iniciar</button>
     <button onclick="stopRobot()">■ Parar</button>
-    <button class="trade" onclick="derivTrade()">🎯 Operar melhor sinal</button>
+    <button class="trade" onclick="derivTrade()">🎯 Operar melhor combo</button>
   </section>
 
   <section class="open-panel panel">
@@ -55,7 +55,7 @@
   <section class="grid">
     <article class="panel">
       <div class="panel-title">
-        <h2>Análise-base M1 + M5 + M15</h2>
+        <h2>Combos confirmados</h2>
         <span id="lastScan">—</span>
       </div>
       <div class="strategy-tags">
@@ -65,7 +65,7 @@
         <span>Tendência de alta/baixa</span>
         <span>Pernadas A/B/C</span>
         <span>3º toque</span>
-        <span>Candle de confirmação</span>
+        <span>Confirmação na próxima vela</span><span>Sem score mínimo</span>
       </div>
       <div id="signals" class="signals"><div class="empty">Clique em “Analisar derivados”.</div></div>
     </article>
@@ -97,10 +97,6 @@
           Operação automática
         </label>
         <p id="autoTradeStatus" class="note">Operação automática: DESLIGADA</p>
-
-        <label>Score mínimo
-          <input id="score" type="number" min="1" max="10" value="7">
-        </label>
         <label>Stop Gain (%)
           <input id="sg" type="number" min="0.1" step="0.1" value="5">
         </label>
@@ -136,6 +132,6 @@
   </section>
 </div>
 
-<script src="/static/app.js?v=4"></script>
+<script src="/static/app.js?v=5"></script>
 </body>
 </html>
