@@ -43,7 +43,7 @@ class Config(BaseModel):
     percentual_entrada:float=1.0
     entrada_tipo:str='percentual'
     valor_entrada:float=1.0
-    operacao_automatica:bool=False
+    operacao_automatica:bool=True
     stop_gain:float=5.0
     stop_loss:float=5.0
     max_entradas:int=5
@@ -56,8 +56,8 @@ config=Config()
 state={
     'running':False,'scanning':False,'balance':1000.0,'start_balance':1000.0,
     'entries':0,'signals':[],'history':[],'open_trade':None,'last_scan':None,
-    'status':'PARADO','auto_status':'DESLIGADA','diagnostics':{},'news':[],
-    'auto_trade':False,'deriv_status':'OK','scanner_heartbeat':0,'news_updated_at':0,'news_status':'AGUARDANDO ATUALIZAÇÃO'
+    'status':'PARADO','auto_status':'LIGADA • aguardando scanner','diagnostics':{},'news':[],
+    'auto_trade':True,'deriv_status':'OK','scanner_heartbeat':0,'news_updated_at':0,'news_status':'AGUARDANDO ATUALIZAÇÃO'
 }
 runtime={'token':None,'account_id':None,'account_type':'','currency':'USD','last_auto_signal_key':None}
 scanner_task=None
@@ -440,7 +440,7 @@ def signal_fresh(best):
     # signal_epoch é o início da vela M1 confirmadora.
     # Após o fechamento, aceita no máximo ~45 s para não entrar atrasado.
     ep=int(best.get('signal_epoch') or 0)
-    return bool(ep) and time.time()<=ep+105
+    return bool(ep) and ep <= time.time() <= ep+150
 
 async def trade_ws_connect(token,account_id,best=None,automatic=False):
     last=None
