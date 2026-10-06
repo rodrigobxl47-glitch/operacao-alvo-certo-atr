@@ -14,7 +14,7 @@ from starlette.middleware.sessions import SessionMiddleware
 BASE_DIR=Path(__file__).resolve().parent
 STATIC_DIR=BASE_DIR/'static'
 
-app=FastAPI(title='Operação Alvo Certo ATR - Deriv MTF v5.1')
+app=FastAPI(title='Operação Alvo Certo ATR - Forex v5.2')
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('SESSION_SECRET',secrets.token_hex(32)),https_only=True,same_site='lax')
 
 PUBLIC_WS='wss://api.derivws.com/trading/v1/options/ws/public'
@@ -23,6 +23,20 @@ OAUTH_AUTH='https://auth.deriv.com/oauth2/auth'
 OAUTH_TOKEN='https://auth.deriv.com/oauth2/token'
 CLIENT_ID=os.getenv('DERIV_CLIENT_ID','')
 REDIRECT_URI=os.getenv('DERIV_REDIRECT_URI','https://operacao-alvo-certo-atr.onrender.com/auth/callback')
+
+FOREX_PAIRS=['EUR/USD','GBP/USD','USD/JPY','USD/CAD','AUD/USD','USD/CHF','NZD/USD']
+FOREX_ALIASES={
+    'EUR/USD':['eurusd','frxeurusd','eur/usd'],
+    'GBP/USD':['gbpusd','frxgbpusd','gbp/usd'],
+    'USD/JPY':['usdjpy','frxusdjpy','usd/jpy'],
+    'USD/CAD':['usdcad','frxusdcad','usd/cad'],
+    'AUD/USD':['audusd','frxaudusd','aud/usd'],
+    'USD/CHF':['usdchf','frxusdchf','usd/chf'],
+    'NZD/USD':['nzdusd','frxnzdusd','nzd/usd'],
+}
+NEWS_URL='https://nfs.faireconomy.media/ff_calendar_thisweek.xml'
+NEWS_INTERVAL=300
+HISTORY_FILE=BASE_DIR/'history.json'
 
 class Config(BaseModel):
     banca_inicial:float=1000.0
@@ -43,7 +57,7 @@ state={
     'running':False,'scanning':False,'balance':1000.0,'start_balance':1000.0,
     'entries':0,'signals':[],'history':[],'open_trade':None,'last_scan':None,
     'status':'PARADO','auto_status':'DESLIGADA','diagnostics':{},'news':[],
-    'auto_trade':False,'deriv_status':'OK'
+    'auto_trade':False,'deriv_status':'OK','scanner_heartbeat':0,'news_updated_at':0,'news_status':'AGUARDANDO ATUALIZAÇÃO'
 }
 runtime={'token':None,'account_id':None,'account_type':'','currency':'USD','last_auto_signal_key':None}
 scanner_task=None
@@ -258,9 +272,6 @@ async def active_symbols():
 def sym_fields(a):
     return a.get('underlying_symbol') or a.get('symbol'),a.get('underlying_symbol_name') or a.get('display_name') or a.get('underlying_symbol') or a.get('symbol')
 
-def is_derived(a):
-    vals=' '.join(str(a.get(k,'')) for k in ('market','submarket','subgroup','underlying_symbol_type','symbol_type','underlying_symbol_name','display_name')).lower()
-    return any(k in vals for k in ('synthetic','derived','volatility','crash','boom','jump','step','range break','drift switch','daily reset','dex'))
 
 async def candles(symbol,granularity,count=111):
     # Evita repetir a mesma consulta dentro do mesmo candle fechado.
@@ -278,6 +289,73 @@ async def candles(symbol,granularity,count=111):
     out=out[-110:];_candle_cache[key]=(bucket,out)
     return out
 
+def norm_pair(v):
+    return ''.join(ch for ch in str(v or '').lower() if ch.isalnum())
+
+def resolve_forex_symbols(active):
+    found={}
+    for a in active or []:
+        market=' '.join(str(a.get(k,'')) for k in ('market','market_display_name','submarket','submarket_display_name')).lower()
+        vals=[a.get(k) for k in ('symbol','display_name','underlying_symbol_name','underlying_symbol','name')]
+        norms=[norm_pair(v) for v in vals if v]
+        for pair,aliases in FOREX_ALIASES.items():
+            if pair in found: continue
+            for alias in aliases:
+                na=norm_pair(alias)
+                if any(na==n or na in n for n in norms):
+                    # Prefer explicit Forex market when the API supplies it; otherwise accept the exact pair alias.
+                    if not market or 'forex' in market or 'currenc' in market or na in ''.join(norms):
+                        found[pair]=a
+                        break
+    return [(pair,found[pair]) for pair in FOREX_PAIRS if pair in found]
+
+def load_history():
+    try:
+        if HISTORY_FILE.exists():
+            data=json.loads(HISTORY_FILE.read_text(encoding='utf-8'))
+            if isinstance(data,list): state['history']=data[:100]
+    except Exception as e:
+        print(f'[ATR] Histórico não carregado: {e}',flush=True)
+
+def save_history():
+    try:
+        tmp=HISTORY_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(state['history'][:100],ensure_ascii=False),encoding='utf-8')
+        tmp.replace(HISTORY_FILE)
+    except Exception as e:
+        print(f'[ATR] Histórico não salvo: {e}',flush=True)
+
+async def update_news(force=False):
+    now=time.time()
+    if not force and now-state.get('news_updated_at',0)<NEWS_INTERVAL:
+        return state['news']
+    try:
+        async with httpx.AsyncClient(timeout=12,headers={'User-Agent':'ATR-Operacao-Alvo-Certo/5.2'}) as client:
+            r=await client.get(NEWS_URL)
+        if r.status_code>=400: raise RuntimeError(f'HTTP {r.status_code}')
+        import xml.etree.ElementTree as ET
+        root=ET.fromstring(r.text)
+        items=[]
+        for ev in root.findall('.//event'):
+            title=(ev.findtext('title') or '').strip()
+            country=(ev.findtext('country') or '').strip().upper()
+            date=(ev.findtext('date') or '').strip()
+            tm=(ev.findtext('time') or '').strip()
+            impact=(ev.findtext('impact') or '').strip().lower()
+            forecast=(ev.findtext('forecast') or '').strip()
+            previous=(ev.findtext('previous') or '').strip()
+            if not title: continue
+            items.append({'title':title,'country':country,'impact':impact,'time':f'{date} {tm}'.strip(),'summary':f'{country} • Impacto: {impact or "n/d"} • Prev.: {previous or "—"} • Previsto: {forecast or "—"}'})
+        state['news']=items[:40]
+        state['news_status']=f'{len(state["news"])} eventos carregados'
+        state['news_updated_at']=now
+    except Exception as e:
+        state['news_status']=f'Calendário indisponível • {str(e)[:90]}'
+        state['news_updated_at']=now
+    return state['news']
+
+load_history()
+
 async def analyze_one(a,sem):
     async with sem:
         symbol,name=sym_fields(a)
@@ -293,18 +371,23 @@ async def analyze_one(a,sem):
 async def scan_once():
     if scan_lock.locked():return state['signals']
     async with scan_lock:
-        state['scanning']=True;state['status']='ESCANEANDO'
+        state['scanning']=True;state['status']='ESCANEANDO';state['scanner_heartbeat']=int(time.time())
         try:
-            syms=[a for a in await active_symbols() if is_derived(a)]
-            # Uma fila controlada: evita rajada de conexões/requisições.
+            active=await active_symbols()
+            resolved=resolve_forex_symbols(active)
             sem=asyncio.Semaphore(1)
             results=[]
-            for a in syms:
-                results.append(await analyze_one(a,sem))
+            for pair,a in resolved:
+                r=await analyze_one(a,sem)
+                if r: r.name=pair
+                results.append(r)
             sig=[x for x in results if x];sig.sort(key=lambda x:x.signal_epoch,reverse=True)
+            found=[pair for pair,_ in resolved]
+            missing=[p for p in FOREX_PAIRS if p not in found]
             state['signals']=[asdict(x) for x in sig[:25]]
-            state['last_scan']=int(time.time())
-            state['diagnostics']={'ativos_derivados':len(syms),'sinais':len(sig),'candles_por_tf':110,'timeframes':['M1','M5','M15'],'base':'Combos independentes','confluencias':['ABC','3º toque tendência','3º toque suporte/resistência']}
+            state['last_scan']=int(time.time());state['scanner_heartbeat']=state['last_scan']
+            state['diagnostics']={'pares_forex':len(resolved),'pares_solicitados':FOREX_PAIRS,'pares_encontrados':found,'pares_nao_encontrados':missing,'sinais':len(sig),'candles_por_tf':110,'timeframes':['M1','M5','M15'],'base':'Combos independentes','confluencias':['ABC','3º toque tendência','3º toque suporte/resistência']}
+            await update_news()
             return state['signals']
         finally:
             state['scanning']=False
@@ -399,7 +482,7 @@ async def monitor_contract(token,account_id,contract_id,entry):
                 if closed:
                     result='WIN' if profit>0 else ('LOSS' if profit<0 else 'EMPATE')
                     entry['result']=result;entry['closed_time']=int(time.time());entry['status']='finalizada'
-                    state['history'].insert(0,dict(entry));state['history']=state['history'][:100];state['open_trade']=None
+                    state['history'].insert(0,dict(entry));state['history']=state['history'][:100];save_history();state['open_trade']=None
                     try:await refresh_runtime_balance()
                     except Exception:state['balance']=round(state['balance']+profit,2)
                     state['status']='ATIVO' if state['running'] else 'PARADO'
@@ -488,6 +571,7 @@ async def scanner_loop():
         while state['running']:
             try:
                 await scan_once()
+                state['scanner_heartbeat']=int(time.time())
                 if state['running'] and not state['open_trade']:state['status']='ATIVO'
                 await maybe_auto_trade()
             except asyncio.CancelledError:raise
@@ -514,7 +598,7 @@ def current_display_status():
 async def home():return FileResponse(STATIC_DIR/'index.html')
 
 @app.get('/health')
-async def health():return {'ok':True,'service':'ATR Deriv MTF v5.1','running':state['running'],'scanning':state['scanning'],'deriv_status':state['deriv_status']}
+async def health():return {'ok':True,'service':'ATR Forex MTF v5.2','running':state['running'],'scanning':state['scanning'],'deriv_status':state['deriv_status']}
 
 @app.get('/auth/login')
 async def auth_login(request:Request):
@@ -571,9 +655,17 @@ async def deriv_trade(request:Request):
 
 @app.get('/api/status')
 async def get_status():
+    global scanner_task
+    if state.get('running') and scanner_task and scanner_task.done() and not state.get('open_trade'):
+        state['running']=False; state['status']='PARADO'; state['auto_status']='LIGADA • scanner parado' if config.operacao_automatica else 'DESLIGADA'
     start=state['start_balance'];pnl=((state['balance']-start)/start)*100 if start else 0
     display=current_display_status()
-    return {**state,'status':display,'display_status':display,'config':config.model_dump(),'pnl_percent':round(pnl,2),'account_selected':bool(runtime['account_id']),'account_type':runtime['account_type'],'currency':runtime['currency']}
+    return {**state,'status':display,'display_status':display,'config':config.model_dump(),'pnl_percent':round(pnl,2),'account_selected':bool(runtime['account_id']),'account_type':runtime['account_type'],'currency':runtime['currency'],'forex_pairs':FOREX_PAIRS}
+
+@app.get('/api/news')
+async def api_news():
+    await update_news(force=True)
+    return {'news':state['news'],'status':state['news_status'],'updated_at':state['news_updated_at']}
 
 @app.post('/api/config')
 async def set_config(new:Config):
