@@ -1,34 +1,124 @@
-Operação Alvo Certo (ATR) — Deriv MTF v2
-Aplicação Web/PWA em FastAPI para análise técnica de índices derivados/sintéticos disponíveis na Deriv.
-Estratégia desta versão
-Trabalha somente com ativos classificados como derivados/sintéticos pelo scanner.
-Usa 110 candles em cada período: M1, M5 e M15.
-Procura confluência da mesma direção nos três tempos gráficos.
-Tendência de alta/baixa: terceiro toque da linha e estrutura de pernadas A/B/C.
-Suporte/resistência: terceiro toque e topo/fundo duplo, com confirmação pelo corpo do candle, evitando validar apenas pavios.
-Rompimento: exige rompimento na direção analisada e nova confirmação.
-Confirmações de alta: Hammer, Inverted Hammer, Bullish Engulfing, Morning Star, Piercing Line, Bullish Harami, Three White Soldiers e Bullish Marubozu.
-Confirmações de baixa: Shooting Star, Hanging Man, Bearish Engulfing, Evening Star, Dark Cloud Cover, Bearish Harami, Three Black Crows e Bearish Marubozu.
-Interface
-Saldo/banca da conta selecionada.
-Seleção de conta Deriv DEMO ou REAL após autenticação.
-Operação aberta com COMPRA/VENDA, valor, P/L e tempo aproximado restante.
-Histórico com WIN, LOSS ou EMPATE.
-Painel informativo de notícias separado do gatilho técnico.
-Confirmação adicional no navegador antes de usar conta REAL.
-Variáveis no Render
-Configure em Environment:
-DERIV_CLIENT_ID = Client ID/App ID da aplicação OAuth Deriv.
-DERIV_REDIRECT_URI = https://SEU-SERVICO.onrender.com/auth/callback
-SESSION_SECRET = chave aleatória longa e secreta.
-Não coloque senha da Deriv, OTP ou access token no GitHub.
-Render
-Build Command: pip install -r requirements.txt
-Start Command: uvicorn main:app --host 0.0.0.0 --port $PORT
-Teste de saúde: /health deve responder com {"ok": true, ...}.
-Local / Termux
+ATR v5.2 FOREX — Operação Alvo Certo
+====================================
+
+OBJETIVO
+--------
+Versão do projeto ATR preparada para trabalhar com Forex na Deriv, substituindo o universo de índices sintéticos.
+
+PARES ANALISADOS
+-----------------
+- EUR/USD
+- GBP/USD
+- USD/JPY
+- USD/CAD
+- AUD/USD
+- USD/CHF
+- NZD/USD
+
+O sistema resolve os códigos dos pares a partir dos ativos disponíveis na Deriv, em vez de depender de um nome fixo como EUR/USD.
+
+ESTRATÉGIA MANTIDA
+------------------
+- 110 candles fechados em M1, M5 e M15.
+- M1 continua sendo o timeframe de entrada/confirmação desta versão.
+- Combos independentes.
+- Suporte forte + 3 contatos + próxima vela de confirmação.
+- Resistência forte + 3 contatos + próxima vela de confirmação.
+- Tendência de alta + ABC + 3º toque + confirmação.
+- Tendência de baixa + ABC + 3º toque + confirmação.
+- Não exige que todos os critérios estejam presentes ao mesmo tempo.
+- Score mínimo removido da decisão.
+
+CONFIRMAÇÕES DE ALTA
+--------------------
+- Hammer
+- Bullish Engulfing
+- Morning Star
+- Piercing Line
+- Bullish Harami
+- Three White Soldiers
+- Bullish Marubozu
+
+CONFIRMAÇÕES DE BAIXA
+---------------------
+- Shooting Star
+- Bearish Engulfing
+- Evening Star
+- Dark Cloud Cover
+- Bearish Harami
+- Three Black Crows
+- Bearish Marubozu
+
+CORREÇÕES DA v5.2
+-----------------
+1. STATUS
+   O status passa a refletir o estado real:
+   - PARADO
+   - ESCANEANDO
+   - ATIVO
+   - OPERAÇÃO ABERTA
+
+2. HISTÓRICO
+   Operações liquidadas são registradas com resultado WIN/LOSS e informações da operação.
+
+3. INFORMAÇÕES/NOTÍCIAS
+   A interface mantém o painel de informações/notícias para o contexto do Forex.
+   Notícias não geram uma entrada automaticamente.
+
+4. ANTI-429
+   Mantida a arquitetura da v5.1 para reduzir excesso de conexões:
+   - WebSocket público persistente.
+   - Cache de ativos.
+   - Cache de candles.
+   - Requisições sequenciais para reduzir rajadas.
+   - Backoff/retry em respostas 429.
+
+RENDER
+------
+Build Command:
 pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8000
-Abra http://127.0.0.1:8000.
-Segurança
-Teste primeiro em DEMO. A opção REAL envia ordens com dinheiro real quando uma conta real estiver selecionada e a ordem for confirmada. Critérios técnicos e padrões de candles não garantem resultado positivo.
+
+Start Command:
+uvicorn main:app --host 0.0.0.0 --port $PORT
+
+VARIÁVEIS DE AMBIENTE
+---------------------
+DERIV_CLIENT_ID
+DERIV_REDIRECT_URI
+SESSION_SECRET
+
+DERIV_REDIRECT_URI deve ser exatamente:
+https://operacao-alvo-certo-atr.onrender.com/auth/callback
+
+IMPORTANTE
+----------
+- Não coloque tokens, senhas, OTPs ou SESSION_SECRET dentro do código.
+- O modo REAL deve ser usado com cautela. O projeto não garante lucro.
+- Forex possui horários de mercado e pode ficar sem candles fora do período disponível.
+- O plano Free do Render pode suspender a aplicação após inatividade; portanto, ele não garante execução contínua 24 horas.
+- Antes de operar com dinheiro real, teste primeiro o fluxo de login, saldo, análise, abertura e liquidação.
+
+ARQUIVOS
+--------
+main.py
+requirements.txt
+static/index.html
+static/app.js
+static/style.css
+README_ATR_v5_2_FOREX.txt
+
+DEPLOY
+------
+1. Extraia o ZIP.
+2. Substitua os arquivos correspondentes no GitHub.
+3. Faça commit/push.
+4. No Render, aguarde o novo deploy.
+5. Abra a aplicação.
+6. Faça login pela Deriv.
+7. Confira se o saldo aparece corretamente.
+8. Confira o status ATIVO/ESCANEANDO.
+9. Confira o histórico depois de uma operação liquidada.
+
+VERSÃO
+-------
+ATR v5.2 FOREX
