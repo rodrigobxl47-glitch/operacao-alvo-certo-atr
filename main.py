@@ -14,7 +14,7 @@ from starlette.middleware.sessions import SessionMiddleware
 BASE_DIR=Path(__file__).resolve().parent
 STATIC_DIR=BASE_DIR/'static'
 
-app=FastAPI(title='Operação Alvo Certo ATR - Forex v5.2')
+app=FastAPI(title='Operação Alvo Certo ATR - Deriv MTF v5.1')
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('SESSION_SECRET',secrets.token_hex(32)),https_only=True,same_site='lax')
 
 PUBLIC_WS='wss://api.derivws.com/trading/v1/options/ws/public'
@@ -24,30 +24,17 @@ OAUTH_TOKEN='https://auth.deriv.com/oauth2/token'
 CLIENT_ID=os.getenv('DERIV_CLIENT_ID','')
 REDIRECT_URI=os.getenv('DERIV_REDIRECT_URI','https://operacao-alvo-certo-atr.onrender.com/auth/callback')
 
-FOREX_PAIRS=['EUR/USD','GBP/USD','USD/JPY','USD/CAD','AUD/USD','USD/CHF','NZD/USD']
-FOREX_ALIASES={
-    'EUR/USD':['eurusd','frxeurusd','eur/usd'],
-    'GBP/USD':['gbpusd','frxgbpusd','gbp/usd'],
-    'USD/JPY':['usdjpy','frxusdjpy','usd/jpy'],
-    'USD/CAD':['usdcad','frxusdcad','usd/cad'],
-    'AUD/USD':['audusd','frxaudusd','aud/usd'],
-    'USD/CHF':['usdchf','frxusdchf','usd/chf'],
-    'NZD/USD':['nzdusd','frxnzdusd','nzd/usd'],
-}
-NEWS_URL='https://nfs.faireconomy.media/ff_calendar_thisweek.xml'
-NEWS_INTERVAL=300
-HISTORY_FILE=BASE_DIR/'history.json'
-
 class Config(BaseModel):
     banca_inicial:float=1000.0
     percentual_entrada:float=1.0
     entrada_tipo:str='percentual'
     valor_entrada:float=1.0
-    operacao_automatica:bool=True
+    operacao_automatica:bool=False
     stop_gain:float=5.0
     stop_loss:float=5.0
     max_entradas:int=5
     duracao_minutos:int=1
+    forca_m15_minima:int=70
 
 class AccountChoice(BaseModel):
     account_id:str
@@ -56,8 +43,8 @@ config=Config()
 state={
     'running':False,'scanning':False,'balance':1000.0,'start_balance':1000.0,
     'entries':0,'signals':[],'history':[],'open_trade':None,'last_scan':None,
-    'status':'PARADO','auto_status':'LIGADA • aguardando scanner','diagnostics':{},'news':[],
-    'auto_trade':True,'deriv_status':'OK','scanner_heartbeat':0,'news_updated_at':0,'news_status':'AGUARDANDO ATUALIZAÇÃO'
+    'status':'PARADO','auto_status':'DESLIGADA','diagnostics':{},'news':[],
+    'auto_trade':False,'deriv_status':'OK'
 }
 runtime={'token':None,'account_id':None,'account_type':'','currency':'USD','last_auto_signal_key':None}
 scanner_task=None
@@ -84,6 +71,8 @@ class Signal:
     support:float=0.0; resistance:float=0.0
     timeframes:List[str]=field(default_factory=list)
     signal_epoch:int=0; touch_epoch:int=0
+    m15_strength_percent:float=0.0; m15_strength_direction:str='NEUTRA'
+    m15_bull_count:int=0; m15_bear_count:int=0; m15_doji_count:int=0
 
 def body(c): return abs(c.close-c.open)
 def rng(c): return max(c.high-c.low,1e-12)
@@ -182,27 +171,54 @@ def trend_third_touch_previous(cs,side):
         if abs(touch-projected)<=tol:return True
     return False
 
-def analyze(symbol,name,m1,m5,m15):
+def m15_strength_from_m1(m1, m15):
+    # Usa exatamente as 15 velas M1 que formam o último M15 já fechado.
+    if not m15:return None
+    target=int(m15[-1].epoch)
+    group=[c for c in m1 if target <= int(c.epoch) < target+900]
+    if len(group)!=15:return None
+    bull_count=sum(1 for c in group if bull(c))
+    bear_count=sum(1 for c in group if bear(c))
+    doji_count=15-bull_count-bear_count
+    if bull_count==bear_count:
+        direction='NEUTRA'
+        percent=max(bull_count,bear_count)/15*100
+    elif bull_count>bear_count:
+        direction='ALTA'
+        percent=bull_count/15*100
+    else:
+        direction='BAIXA'
+        percent=bear_count/15*100
+    return {'percent':round(percent,1),'direction':direction,'bull':bull_count,'bear':bear_count,'doji':doji_count,'epoch':target}
+
+def m15_strength_allows(side, strength, minimum):
+    if not strength:return False
+    expected='ALTA' if side=='CALL' else 'BAIXA'
+    return strength['direction']==expected and strength['percent'] >= float(minimum)
+
+def analyze(symbol,name,m1,m5,m15,min_strength=70):
     if min(len(m1),len(m5),len(m15))<110:return None
     m1,m5,m15=m1[-110:],m5[-110:],m15[-110:]
+    strength=m15_strength_from_m1(m1,m15)
+    if not strength:return None
     support,resistance=strong_support_resistance(m1);candidates=[]
     for side in ('CALL','PUT'):
         pat=candle_pattern(m1,side)
         if not pat:continue
         touch_epoch,signal_epoch=m1[-2].epoch,m1[-1].epoch
-        if sr_third_touch_previous(m1,side,support,resistance):
+        if m15_strength_allows(side,strength,min_strength) and sr_third_touch_previous(m1,side,support,resistance):
             combo='COMBO SUPORTE' if side=='CALL' else 'COMBO RESISTÊNCIA'
-            reasons=['2 contatos anteriores no nível forte','3º toque na penúltima vela M1',f'Próxima vela confirmou: {pat}']
+            reasons=['2 contatos anteriores no nível forte','3º toque na penúltima vela M1',f'Próxima vela confirmou: {pat}',f'Força M15 pelo M1: {strength["bull"]} verdes / {strength["bear"]} vermelhas / {strength["doji"]} dojis = {strength["percent"]:.1f}% {strength["direction"]}']
             candidates.append((3,side,combo,f'{combo} • 3º toque • próxima vela confirmou',reasons,pat,touch_epoch,signal_epoch))
         expected='ALTA' if side=='CALL' else 'BAIXA'
         t1,t5,t15=trend_direction(m1),trend_direction(m5),trend_direction(m15)
-        if t1==expected and (t5==expected or t15==expected) and abc_confluence(m1,side) and trend_third_touch_previous(m1,side):
+        if m15_strength_allows(side,strength,min_strength) and t1==expected and (t5==expected or t15==expected) and abc_confluence(m1,side) and trend_third_touch_previous(m1,side):
             combo='COMBO TENDÊNCIA ALTA' if side=='CALL' else 'COMBO TENDÊNCIA BAIXA'
-            reasons=[f'Tendência M1: {t1}',f'Contexto M5/M15: {t5}/{t15}','ABC confirmado','3º toque na penúltima vela M1',f'Próxima vela confirmou: {pat}']
+            reasons=[f'Tendência M1: {t1}',f'Contexto M5/M15: {t5}/{t15}','ABC confirmado','3º toque na penúltima vela M1',f'Próxima vela confirmou: {pat}',f'Força M15 pelo M1: {strength["bull"]} verdes / {strength["bear"]} vermelhas / {strength["doji"]} dojis = {strength["percent"]:.1f}% {strength["direction"]}']
             candidates.append((2,side,combo,f'Tendência {expected} • ABC • 3º toque • próxima vela confirmou',reasons,pat,touch_epoch,signal_epoch))
     if not candidates:return None
     _,side,combo,analysis,reasons,pat,touch_epoch,signal_epoch=max(candidates,key=lambda z:z[0])
-    return Signal(symbol,name,side,m1[-1].close,analysis,pat,combo,reasons,support,resistance,['M1','M5','M15'],signal_epoch,touch_epoch)
+    return Signal(symbol,name,side,m1[-1].close,analysis,pat,combo,reasons,support,resistance,['M1','M5','M15'],signal_epoch,touch_epoch,strength['percent'],strength['direction'],strength['bull'],strength['bear'],strength['doji'])
 
 def is_429(e):
     s=str(e).lower()
@@ -272,6 +288,9 @@ async def active_symbols():
 def sym_fields(a):
     return a.get('underlying_symbol') or a.get('symbol'),a.get('underlying_symbol_name') or a.get('display_name') or a.get('underlying_symbol') or a.get('symbol')
 
+def is_derived(a):
+    vals=' '.join(str(a.get(k,'')) for k in ('market','submarket','subgroup','underlying_symbol_type','symbol_type','underlying_symbol_name','display_name')).lower()
+    return any(k in vals for k in ('synthetic','derived','volatility','crash','boom','jump','step','range break','drift switch','daily reset','dex'))
 
 async def candles(symbol,granularity,count=111):
     # Evita repetir a mesma consulta dentro do mesmo candle fechado.
@@ -289,73 +308,6 @@ async def candles(symbol,granularity,count=111):
     out=out[-110:];_candle_cache[key]=(bucket,out)
     return out
 
-def norm_pair(v):
-    return ''.join(ch for ch in str(v or '').lower() if ch.isalnum())
-
-def resolve_forex_symbols(active):
-    found={}
-    for a in active or []:
-        market=' '.join(str(a.get(k,'')) for k in ('market','market_display_name','submarket','submarket_display_name')).lower()
-        vals=[a.get(k) for k in ('symbol','display_name','underlying_symbol_name','underlying_symbol','name')]
-        norms=[norm_pair(v) for v in vals if v]
-        for pair,aliases in FOREX_ALIASES.items():
-            if pair in found: continue
-            for alias in aliases:
-                na=norm_pair(alias)
-                if any(na==n or na in n for n in norms):
-                    # Prefer explicit Forex market when the API supplies it; otherwise accept the exact pair alias.
-                    if not market or 'forex' in market or 'currenc' in market or na in ''.join(norms):
-                        found[pair]=a
-                        break
-    return [(pair,found[pair]) for pair in FOREX_PAIRS if pair in found]
-
-def load_history():
-    try:
-        if HISTORY_FILE.exists():
-            data=json.loads(HISTORY_FILE.read_text(encoding='utf-8'))
-            if isinstance(data,list): state['history']=data[:100]
-    except Exception as e:
-        print(f'[ATR] Histórico não carregado: {e}',flush=True)
-
-def save_history():
-    try:
-        tmp=HISTORY_FILE.with_suffix('.tmp')
-        tmp.write_text(json.dumps(state['history'][:100],ensure_ascii=False),encoding='utf-8')
-        tmp.replace(HISTORY_FILE)
-    except Exception as e:
-        print(f'[ATR] Histórico não salvo: {e}',flush=True)
-
-async def update_news(force=False):
-    now=time.time()
-    if not force and now-state.get('news_updated_at',0)<NEWS_INTERVAL:
-        return state['news']
-    try:
-        async with httpx.AsyncClient(timeout=12,headers={'User-Agent':'ATR-Operacao-Alvo-Certo/5.2'}) as client:
-            r=await client.get(NEWS_URL)
-        if r.status_code>=400: raise RuntimeError(f'HTTP {r.status_code}')
-        import xml.etree.ElementTree as ET
-        root=ET.fromstring(r.text)
-        items=[]
-        for ev in root.findall('.//event'):
-            title=(ev.findtext('title') or '').strip()
-            country=(ev.findtext('country') or '').strip().upper()
-            date=(ev.findtext('date') or '').strip()
-            tm=(ev.findtext('time') or '').strip()
-            impact=(ev.findtext('impact') or '').strip().lower()
-            forecast=(ev.findtext('forecast') or '').strip()
-            previous=(ev.findtext('previous') or '').strip()
-            if not title: continue
-            items.append({'title':title,'country':country,'impact':impact,'time':f'{date} {tm}'.strip(),'summary':f'{country} • Impacto: {impact or "n/d"} • Prev.: {previous or "—"} • Previsto: {forecast or "—"}'})
-        state['news']=items[:40]
-        state['news_status']=f'{len(state["news"])} eventos carregados'
-        state['news_updated_at']=now
-    except Exception as e:
-        state['news_status']=f'Calendário indisponível • {str(e)[:90]}'
-        state['news_updated_at']=now
-    return state['news']
-
-load_history()
-
 async def analyze_one(a,sem):
     async with sem:
         symbol,name=sym_fields(a)
@@ -364,30 +316,25 @@ async def analyze_one(a,sem):
             m1=await candles(symbol,60)
             m5=await candles(symbol,300)
             m15=await candles(symbol,900)
-            return analyze(symbol,name,m1,m5,m15)
+            return analyze(symbol,name,m1,m5,m15,config.forca_m15_minima)
         except Exception as e:
             print(f'[ATR] Falha {symbol}: {e}',flush=True);return None
 
 async def scan_once():
     if scan_lock.locked():return state['signals']
     async with scan_lock:
-        state['scanning']=True;state['status']='ESCANEANDO';state['scanner_heartbeat']=int(time.time())
+        state['scanning']=True;state['status']='ESCANEANDO'
         try:
-            active=await active_symbols()
-            resolved=resolve_forex_symbols(active)
+            syms=[a for a in await active_symbols() if is_derived(a)]
+            # Uma fila controlada: evita rajada de conexões/requisições.
             sem=asyncio.Semaphore(1)
             results=[]
-            for pair,a in resolved:
-                r=await analyze_one(a,sem)
-                if r: r.name=pair
-                results.append(r)
+            for a in syms:
+                results.append(await analyze_one(a,sem))
             sig=[x for x in results if x];sig.sort(key=lambda x:x.signal_epoch,reverse=True)
-            found=[pair for pair,_ in resolved]
-            missing=[p for p in FOREX_PAIRS if p not in found]
             state['signals']=[asdict(x) for x in sig[:25]]
-            state['last_scan']=int(time.time());state['scanner_heartbeat']=state['last_scan']
-            state['diagnostics']={'pares_forex':len(resolved),'pares_solicitados':FOREX_PAIRS,'pares_encontrados':found,'pares_nao_encontrados':missing,'sinais':len(sig),'candles_por_tf':110,'timeframes':['M1','M5','M15'],'base':'Combos independentes','confluencias':['ABC','3º toque tendência','3º toque suporte/resistência']}
-            await update_news()
+            state['last_scan']=int(time.time())
+            state['diagnostics']={'ativos_derivados':len(syms),'sinais':len(sig),'candles_por_tf':110,'timeframes':['M1','M5','M15'],'base':'Combos independentes + força M15 pelo M1','forca_m15_minima':config.forca_m15_minima,'confluencias':['ABC','3º toque tendência','3º toque suporte/resistência']}
             return state['signals']
         finally:
             state['scanning']=False
@@ -440,7 +387,7 @@ def signal_fresh(best):
     # signal_epoch é o início da vela M1 confirmadora.
     # Após o fechamento, aceita no máximo ~45 s para não entrar atrasado.
     ep=int(best.get('signal_epoch') or 0)
-    return bool(ep) and ep <= time.time() <= ep+150
+    return bool(ep) and time.time()<=ep+105
 
 async def trade_ws_connect(token,account_id,best=None,automatic=False):
     last=None
@@ -482,7 +429,7 @@ async def monitor_contract(token,account_id,contract_id,entry):
                 if closed:
                     result='WIN' if profit>0 else ('LOSS' if profit<0 else 'EMPATE')
                     entry['result']=result;entry['closed_time']=int(time.time());entry['status']='finalizada'
-                    state['history'].insert(0,dict(entry));state['history']=state['history'][:100];save_history();state['open_trade']=None
+                    state['history'].insert(0,dict(entry));state['history']=state['history'][:100];state['open_trade']=None
                     try:await refresh_runtime_balance()
                     except Exception:state['balance']=round(state['balance']+profit,2)
                     state['status']='ATIVO' if state['running'] else 'PARADO'
@@ -571,7 +518,6 @@ async def scanner_loop():
         while state['running']:
             try:
                 await scan_once()
-                state['scanner_heartbeat']=int(time.time())
                 if state['running'] and not state['open_trade']:state['status']='ATIVO'
                 await maybe_auto_trade()
             except asyncio.CancelledError:raise
@@ -598,7 +544,7 @@ def current_display_status():
 async def home():return FileResponse(STATIC_DIR/'index.html')
 
 @app.get('/health')
-async def health():return {'ok':True,'service':'ATR Forex MTF v5.2','running':state['running'],'scanning':state['scanning'],'deriv_status':state['deriv_status']}
+async def health():return {'ok':True,'service':'ATR Deriv MTF v5.1','running':state['running'],'scanning':state['scanning'],'deriv_status':state['deriv_status']}
 
 @app.get('/auth/login')
 async def auth_login(request:Request):
@@ -655,17 +601,9 @@ async def deriv_trade(request:Request):
 
 @app.get('/api/status')
 async def get_status():
-    global scanner_task
-    if state.get('running') and scanner_task and scanner_task.done() and not state.get('open_trade'):
-        state['running']=False; state['status']='PARADO'; state['auto_status']='LIGADA • scanner parado' if config.operacao_automatica else 'DESLIGADA'
     start=state['start_balance'];pnl=((state['balance']-start)/start)*100 if start else 0
     display=current_display_status()
-    return {**state,'status':display,'display_status':display,'config':config.model_dump(),'pnl_percent':round(pnl,2),'account_selected':bool(runtime['account_id']),'account_type':runtime['account_type'],'currency':runtime['currency'],'forex_pairs':FOREX_PAIRS}
-
-@app.get('/api/news')
-async def api_news():
-    await update_news(force=True)
-    return {'news':state['news'],'status':state['news_status'],'updated_at':state['news_updated_at']}
+    return {**state,'status':display,'display_status':display,'config':config.model_dump(),'pnl_percent':round(pnl,2),'account_selected':bool(runtime['account_id']),'account_type':runtime['account_type'],'currency':runtime['currency']}
 
 @app.post('/api/config')
 async def set_config(new:Config):
