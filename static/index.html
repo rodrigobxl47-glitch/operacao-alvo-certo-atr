@@ -13,7 +13,7 @@
   <header>
     <div>
       <h1>Operação Alvo Certo <span>(ATR)</span></h1>
-      <p>Análise-base • Suporte/Resistência forte • Tendência • ABC • 3º toque • Força M15 pelo M1</p>
+      <p>Combos • Suporte/Resistência forte • Tendência + ABC • 3º toque • próxima vela confirma</p>
     </div>
     <div id="robotBadge" class="badge off">PARADO</div>
   </header>
@@ -44,7 +44,7 @@
     <button class="primary" onclick="scan()">🔎 Analisar Forex</button>
     <button onclick="startRobot()">▶ Iniciar</button>
     <button onclick="stopRobot()">■ Parar</button>
-    <button class="trade" onclick="derivTrade()">🎯 Operar melhor sinal</button>
+    <button class="trade" onclick="derivTrade()">🎯 Operar melhor combo</button>
   </section>
 
   <section class="open-panel panel">
@@ -55,19 +55,17 @@
   <section class="grid">
     <article class="panel">
       <div class="panel-title">
-        <h2>Análise-base M1 + M5 + M15</h2>
+        <h2>Combos confirmados</h2>
         <span id="lastScan">—</span>
       </div>
       <div class="strategy-tags">
-        <span>FOREX: EUR/USD</span><span>GBP/USD</span><span>USD/JPY</span><span>USD/CAD</span><span>AUD/USD</span><span>USD/CHF</span><span>NZD/USD</span>
         <span>110 candles fechados</span>
         <span>Suporte forte mais baixo</span>
         <span>Resistência forte mais alta</span>
         <span>Tendência de alta/baixa</span>
-        <span>Força M15 pelo M1</span>
         <span>Pernadas A/B/C</span>
         <span>3º toque</span>
-        <span>Candle de confirmação</span>
+        <span>Confirmação na próxima vela</span><span>Sem score mínimo</span>
       </div>
       <div id="signals" class="signals"><div class="empty">Clique em “Analisar Forex”.</div></div>
     </article>
@@ -95,20 +93,10 @@
         </label>
 
         <label style="display:flex;align-items:center;gap:10px">
-          <input id="operacaoAutomatica" type="checkbox" style="width:auto">
+          <input id="operacaoAutomatica" type="checkbox" style="width:auto" checked>
           Operação automática
         </label>
         <p id="autoTradeStatus" class="note">Operação automática: DESLIGADA</p>
-
-        <label>Força mínima do M15 pelo M1
-          <select id="forcaM15">
-            <option value="60">60% (mín. 9/15)</option>
-            <option value="70" selected>70% (mín. 11/15)</option>
-            <option value="80">80% (mín. 12/15)</option>
-            <option value="90">90% (mín. 14/15)</option>
-            <option value="100">100% (15/15)</option>
-          </select>
-        </label>
         <label>Stop Gain (%)
           <input id="sg" type="number" min="0.1" step="0.1" value="5">
         </label>
@@ -124,15 +112,15 @@
 
         <button class="primary" type="submit">Salvar configurações</button>
       </form>
-      <p class="note"><strong>AUTO:</strong> quando ligado e o scanner estiver ATIVO, o sistema pode abrir automaticamente o melhor sinal confirmado. Apenas uma operação fica aberta por vez.</p>
+      <p class="note"><strong>AUTO:</strong> quando ligado e o scanner estiver ATIVO, o sistema abre automaticamente o melhor sinal confirmado. Apenas uma operação fica aberta por vez.</p>
       <p class="note"><strong>REAL:</strong> usa dinheiro real. Valide a estratégia em DEMO antes de selecionar uma conta real.</p>
     </article>
   </section>
 
   <section class="panel news">
-    <div class="panel-title"><h2>Notícias e informações</h2><span>Forex • calendário econômico</span></div>
+    <div class="panel-title"><h2>Notícias e informações</h2><span>Informativo</span></div>
     <div id="news"><div class="empty">Sem informação de notícias vinculada ao ativo no momento.</div></div>
-    <p class="note">A análise usa somente os 7 pares Forex definidos: EUR/USD, GBP/USD, USD/JPY, USD/CAD, AUD/USD, USD/CHF e NZD/USD. A força do M15 é calculada pelas 15 velas M1 que formam o último M15 fechado. Dojis são neutros. O filtro exige que a direção do M15 concorde com o sinal e atinja o percentual escolhido.</p>
+    <p class="note">Notícias econômicas são informativas e podem aumentar a volatilidade do Forex. O painel não gera entradas sozinho; o gatilho continua sendo exclusivamente técnico.</p>
   </section>
 
   <section class="panel">
