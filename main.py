@@ -14,7 +14,7 @@ from starlette.middleware.sessions import SessionMiddleware
 BASE_DIR=Path(__file__).resolve().parent
 STATIC_DIR=BASE_DIR/'static'
 
-app=FastAPI(title='Operação Alvo Certo ATR - Deriv MTF v5.1')
+app=FastAPI(title='Operação Alvo Certo ATR - Deriv Forex v5.2')
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('SESSION_SECRET',secrets.token_hex(32)),https_only=True,same_site='lax')
 
 PUBLIC_WS='wss://api.derivws.com/trading/v1/options/ws/public'
@@ -47,6 +47,10 @@ state={
     'auto_trade':False,'deriv_status':'OK'
 }
 runtime={'token':None,'account_id':None,'account_type':'','currency':'USD','last_auto_signal_key':None}
+FOREX_PAIRS=['EUR/USD','GBP/USD','USD/JPY','USD/CAD','AUD/USD','USD/CHF','NZD/USD']
+FOREX_ALIASES={p:(''.join(ch for ch in p.lower() if ch.isalnum()), p.lower()) for p in FOREX_PAIRS}
+HISTORY_FILE=BASE_DIR/'atr_history.json'
+NEWS_CACHE={'time':0.0,'items':[]}
 scanner_task=None
 scan_lock=asyncio.Lock()
 trade_lock=asyncio.Lock()
@@ -60,6 +64,23 @@ _public_backoff_until=0.0
 _active_cache={'time':0.0,'data':[]}
 _candle_cache={}
 
+def load_history():
+    try:
+        if HISTORY_FILE.exists():
+            data=json.loads(HISTORY_FILE.read_text(encoding='utf-8'))
+            return data if isinstance(data,list) else []
+    except Exception as e: print(f'[ATR] histórico não carregado: {e}',flush=True)
+    return []
+
+def save_history():
+    try:
+        tmp=HISTORY_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(state['history'][:100],ensure_ascii=False,indent=2),encoding='utf-8')
+        tmp.replace(HISTORY_FILE)
+    except Exception as e: print(f'[ATR] histórico não salvo: {e}',flush=True)
+
+state['history']=load_history()
+
 @dataclass
 class Candle:
     epoch:int; open:float; high:float; low:float; close:float
@@ -71,8 +92,6 @@ class Signal:
     support:float=0.0; resistance:float=0.0
     timeframes:List[str]=field(default_factory=list)
     signal_epoch:int=0; touch_epoch:int=0
-    m15_strength_percent:float=0.0; m15_strength_direction:str='NEUTRA'
-    m15_bull_count:int=0; m15_bear_count:int=0; m15_doji_count:int=0
 
 def body(c): return abs(c.close-c.open)
 def rng(c): return max(c.high-c.low,1e-12)
@@ -171,54 +190,32 @@ def trend_third_touch_previous(cs,side):
         if abs(touch-projected)<=tol:return True
     return False
 
-def m15_strength_from_m1(m1, m15):
-    # Usa exatamente as 15 velas M1 que formam o último M15 já fechado.
-    if not m15:return None
-    target=int(m15[-1].epoch)
-    group=[c for c in m1 if target <= int(c.epoch) < target+900]
-    if len(group)!=15:return None
-    bull_count=sum(1 for c in group if bull(c))
-    bear_count=sum(1 for c in group if bear(c))
-    doji_count=15-bull_count-bear_count
-    if bull_count==bear_count:
-        direction='NEUTRA'
-        percent=max(bull_count,bear_count)/15*100
-    elif bull_count>bear_count:
-        direction='ALTA'
-        percent=bull_count/15*100
-    else:
-        direction='BAIXA'
-        percent=bear_count/15*100
-    return {'percent':round(percent,1),'direction':direction,'bull':bull_count,'bear':bear_count,'doji':doji_count,'epoch':target}
-
-def m15_strength_allows(side, strength, minimum):
-    if not strength:return False
-    expected='ALTA' if side=='CALL' else 'BAIXA'
-    return strength['direction']==expected and strength['percent'] >= float(minimum)
-
-def analyze(symbol,name,m1,m5,m15,min_strength=70):
+def analyze(symbol,name,m1,m5,m15):
     if min(len(m1),len(m5),len(m15))<110:return None
     m1,m5,m15=m1[-110:],m5[-110:],m15[-110:]
-    strength=m15_strength_from_m1(m1,m15)
-    if not strength:return None
     support,resistance=strong_support_resistance(m1);candidates=[]
+    strength=m15_strength_from_m1(m1)
+    min_strength=max(60,min(100,int(config.forca_m15_minima)))
     for side in ('CALL','PUT'):
         pat=candle_pattern(m1,side)
         if not pat:continue
+        expected_strength='ALTA' if side=='CALL' else 'BAIXA'
+        if strength['direction']!=expected_strength or strength['percent']<min_strength:
+            continue
         touch_epoch,signal_epoch=m1[-2].epoch,m1[-1].epoch
-        if m15_strength_allows(side,strength,min_strength) and sr_third_touch_previous(m1,side,support,resistance):
+        if sr_third_touch_previous(m1,side,support,resistance):
             combo='COMBO SUPORTE' if side=='CALL' else 'COMBO RESISTÊNCIA'
-            reasons=['2 contatos anteriores no nível forte','3º toque na penúltima vela M1',f'Próxima vela confirmou: {pat}',f'Força M15 pelo M1: {strength["bull"]} verdes / {strength["bear"]} vermelhas / {strength["doji"]} dojis = {strength["percent"]:.1f}% {strength["direction"]}']
+            reasons=['2 contatos anteriores no nível forte','3º toque na penúltima vela M1',f'Próxima vela confirmou: {pat}',f'Força M15 pelo M1: {strength["percent"]:.1f}% {strength["direction"]} ({strength["bull"]} verdes / {strength["bear"]} vermelhas / {strength["doji"]} dojis)']
             candidates.append((3,side,combo,f'{combo} • 3º toque • próxima vela confirmou',reasons,pat,touch_epoch,signal_epoch))
         expected='ALTA' if side=='CALL' else 'BAIXA'
         t1,t5,t15=trend_direction(m1),trend_direction(m5),trend_direction(m15)
-        if m15_strength_allows(side,strength,min_strength) and t1==expected and (t5==expected or t15==expected) and abc_confluence(m1,side) and trend_third_touch_previous(m1,side):
+        if t1==expected and (t5==expected or t15==expected) and abc_confluence(m1,side) and trend_third_touch_previous(m1,side):
             combo='COMBO TENDÊNCIA ALTA' if side=='CALL' else 'COMBO TENDÊNCIA BAIXA'
-            reasons=[f'Tendência M1: {t1}',f'Contexto M5/M15: {t5}/{t15}','ABC confirmado','3º toque na penúltima vela M1',f'Próxima vela confirmou: {pat}',f'Força M15 pelo M1: {strength["bull"]} verdes / {strength["bear"]} vermelhas / {strength["doji"]} dojis = {strength["percent"]:.1f}% {strength["direction"]}']
+            reasons=[f'Tendência M1: {t1}',f'Contexto M5/M15: {t5}/{t15}','ABC confirmado','3º toque na penúltima vela M1',f'Próxima vela confirmou: {pat}',f'Força M15 pelo M1: {strength["percent"]:.1f}% {strength["direction"]} ({strength["bull"]} verdes / {strength["bear"]} vermelhas / {strength["doji"]} dojis)']
             candidates.append((2,side,combo,f'Tendência {expected} • ABC • 3º toque • próxima vela confirmou',reasons,pat,touch_epoch,signal_epoch))
     if not candidates:return None
     _,side,combo,analysis,reasons,pat,touch_epoch,signal_epoch=max(candidates,key=lambda z:z[0])
-    return Signal(symbol,name,side,m1[-1].close,analysis,pat,combo,reasons,support,resistance,['M1','M5','M15'],signal_epoch,touch_epoch,strength['percent'],strength['direction'],strength['bull'],strength['bear'],strength['doji'])
+    return Signal(symbol,name,side,m1[-1].close,analysis,pat,combo,reasons,support,resistance,['M1','M5','M15'],signal_epoch,touch_epoch)
 
 def is_429(e):
     s=str(e).lower()
@@ -288,9 +285,30 @@ async def active_symbols():
 def sym_fields(a):
     return a.get('underlying_symbol') or a.get('symbol'),a.get('underlying_symbol_name') or a.get('display_name') or a.get('underlying_symbol') or a.get('symbol')
 
-def is_derived(a):
-    vals=' '.join(str(a.get(k,'')) for k in ('market','submarket','subgroup','underlying_symbol_type','symbol_type','underlying_symbol_name','display_name')).lower()
-    return any(k in vals for k in ('synthetic','derived','volatility','crash','boom','jump','step','range break','drift switch','daily reset','dex'))
+def norm_pair(v):
+    return ''.join(ch for ch in str(v).lower() if ch.isalnum())
+
+def resolve_forex_symbols(active):
+    found=[];missing=[]
+    for pair in FOREX_PAIRS:
+        target=norm_pair(pair);hit=None
+        for a in active:
+            symbol,name=sym_fields(a)
+            vals=[norm_pair(symbol),norm_pair(name),norm_pair(a.get('underlying_symbol_type','')),norm_pair(a.get('market',''))]
+            if target in vals[:2] or any(target in v for v in vals[:2]):
+                hit=a;break
+        if hit: found.append(hit)
+        else: missing.append(pair)
+    return found,missing
+
+def m15_strength_from_m1(m1):
+    # Último M15 totalmente fechado = exatamente 15 candles M1 do mesmo bucket.
+    if len(m1)<15:return {'direction':'NEUTRA','percent':0.0,'bull':0,'bear':0,'doji':0,'required':15}
+    closed=m1[-15:]
+    bull_n=sum(1 for c in closed if bull(c));bear_n=sum(1 for c in closed if bear(c));doji_n=15-bull_n-bear_n
+    if bull_n==bear_n:return {'direction':'NEUTRA','percent':round(max(bull_n,bear_n)/15*100,1),'bull':bull_n,'bear':bear_n,'doji':doji_n,'required':15}
+    direction='ALTA' if bull_n>bear_n else 'BAIXA'; pct=round(max(bull_n,bear_n)/15*100,1)
+    return {'direction':direction,'percent':pct,'bull':bull_n,'bear':bear_n,'doji':doji_n,'required':15}
 
 async def candles(symbol,granularity,count=111):
     # Evita repetir a mesma consulta dentro do mesmo candle fechado.
@@ -316,7 +334,7 @@ async def analyze_one(a,sem):
             m1=await candles(symbol,60)
             m5=await candles(symbol,300)
             m15=await candles(symbol,900)
-            return analyze(symbol,name,m1,m5,m15,config.forca_m15_minima)
+            return analyze(symbol,name,m1,m5,m15)
         except Exception as e:
             print(f'[ATR] Falha {symbol}: {e}',flush=True);return None
 
@@ -325,8 +343,8 @@ async def scan_once():
     async with scan_lock:
         state['scanning']=True;state['status']='ESCANEANDO'
         try:
-            syms=[a for a in await active_symbols() if is_derived(a)]
-            # Uma fila controlada: evita rajada de conexões/requisições.
+            active=await active_symbols()
+            syms,missing=resolve_forex_symbols(active)
             sem=asyncio.Semaphore(1)
             results=[]
             for a in syms:
@@ -334,7 +352,7 @@ async def scan_once():
             sig=[x for x in results if x];sig.sort(key=lambda x:x.signal_epoch,reverse=True)
             state['signals']=[asdict(x) for x in sig[:25]]
             state['last_scan']=int(time.time())
-            state['diagnostics']={'ativos_derivados':len(syms),'sinais':len(sig),'candles_por_tf':110,'timeframes':['M1','M5','M15'],'base':'Combos independentes + força M15 pelo M1','forca_m15_minima':config.forca_m15_minima,'confluencias':['ABC','3º toque tendência','3º toque suporte/resistência']}
+            state['diagnostics']={'mercado':'FOREX','pares_solicitados':FOREX_PAIRS,'pares_encontrados':[sym_fields(a)[1] for a in syms],'pares_nao_encontrados':missing,'sinais':len(sig),'candles_por_tf':110,'timeframes':['M1','M5','M15'],'base':'Combos independentes','forca_m15_minima':config.forca_m15_minima,'confluencias':['ABC','3º toque tendência','3º toque suporte/resistência','força M15 pelo M1']}
             return state['signals']
         finally:
             state['scanning']=False
@@ -429,7 +447,7 @@ async def monitor_contract(token,account_id,contract_id,entry):
                 if closed:
                     result='WIN' if profit>0 else ('LOSS' if profit<0 else 'EMPATE')
                     entry['result']=result;entry['closed_time']=int(time.time());entry['status']='finalizada'
-                    state['history'].insert(0,dict(entry));state['history']=state['history'][:100];state['open_trade']=None
+                    state['history'].insert(0,dict(entry));state['history']=state['history'][:100];save_history();state['open_trade']=None
                     try:await refresh_runtime_balance()
                     except Exception:state['balance']=round(state['balance']+profit,2)
                     state['status']='ATIVO' if state['running'] else 'PARADO'
@@ -534,6 +552,27 @@ async def scanner_loop():
     finally:
         if not state['running'] and not state['open_trade']:state['status']='PARADO'
 
+async def fetch_forex_news():
+    now=time.monotonic()
+    if now-NEWS_CACHE['time']<900 and NEWS_CACHE['items']:
+        return NEWS_CACHE['items']
+    url='https://nfs.faireconomy.media/ff_calendar_thisweek.json'
+    currencies={p.split('/')[0] for p in FOREX_PAIRS}|{p.split('/')[1] for p in FOREX_PAIRS}
+    try:
+        async with httpx.AsyncClient(timeout=12,headers={'User-Agent':'ATR-Forex/5.2'}) as client:
+            r=await client.get(url);r.raise_for_status();raw=r.json()
+        items=[]
+        for n in raw if isinstance(raw,list) else []:
+            cur=str(n.get('country') or n.get('currency') or '').upper()
+            impact=str(n.get('impact') or '').lower()
+            if cur not in currencies or impact not in ('high','medium'):continue
+            items.append({'title':str(n.get('title') or n.get('event') or 'Evento econômico'),'time':str(n.get('date') or n.get('time') or ''),'currency':cur,'impact':impact.upper(),'summary':f'Impacto {impact.upper()} • {cur} • valor anterior: {n.get("previous", "—")} • previsão: {n.get("forecast", "—")}','pair_scope':[p for p in FOREX_PAIRS if cur in p]})
+        NEWS_CACHE.update({'time':now,'items':items[:40]});state['news']=NEWS_CACHE['items']
+    except Exception as e:
+        NEWS_CACHE['time']=now
+        state['news']=state.get('news') or [{'title':'Calendário econômico indisponível','time':'','summary':'Não foi possível atualizar as notícias agora. A análise técnica continua normalmente.'}]
+    return state['news']
+
 def current_display_status():
     if state.get('open_trade'):return 'OPERAÇÃO ABERTA'
     if state.get('scanning'):return 'ESCANEANDO'
@@ -601,6 +640,7 @@ async def deriv_trade(request:Request):
 
 @app.get('/api/status')
 async def get_status():
+    await fetch_forex_news()
     start=state['start_balance'];pnl=((state['balance']-start)/start)*100 if start else 0
     display=current_display_status()
     return {**state,'status':display,'display_status':display,'config':config.model_dump(),'pnl_percent':round(pnl,2),'account_selected':bool(runtime['account_id']),'account_type':runtime['account_type'],'currency':runtime['currency']}
@@ -610,6 +650,7 @@ async def set_config(new:Config):
     global config
     if new.entrada_tipo.lower() not in ('percentual','valor'):raise HTTPException(400,"entrada_tipo deve ser 'percentual' ou 'valor'.")
     if new.percentual_entrada<=0 or new.valor_entrada<=0:raise HTTPException(400,'Entrada deve ser maior que zero.')
+    if new.forca_m15_minima not in (60,70,80,90,100):raise HTTPException(400,'Força M15 deve ser 60, 70, 80, 90 ou 100%.')
     if runtime['account_id']:new=new.model_copy(update={'banca_inicial':state['start_balance']})
     config=new;state['auto_trade']=config.operacao_automatica
     state['auto_status']='AGUARDANDO COMBO' if config.operacao_automatica and state['running'] else ('LIGADA • scanner parado' if config.operacao_automatica else 'DESLIGADA')
