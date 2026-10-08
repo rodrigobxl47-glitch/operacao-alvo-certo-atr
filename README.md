@@ -1,4 +1,4 @@
-ATR v5.2 FOREX — Operação Alvo Certo
+ATR v5.2.1 FOREX • Pernadas — Operação Alvo Certo
 ====================================
 
 OBJETIVO
@@ -22,10 +22,11 @@ ESTRATÉGIA MANTIDA
 - 110 candles fechados em M1, M5 e M15.
 - M1 continua sendo o timeframe de entrada/confirmação desta versão.
 - Combos independentes.
-- Suporte forte + 3 contatos + próxima vela de confirmação.
-- Resistência forte + 3 contatos + próxima vela de confirmação.
-- Tendência de alta + ABC + 3º toque + confirmação.
-- Tendência de baixa + ABC + 3º toque + confirmação.
+- Suporte forte no limite mais baixo do gráfico + 3 contatos + próxima vela de confirmação.
+- Resistência forte no limite mais alto do gráfico + 3 contatos + próxima vela de confirmação.
+- Tendência de alta + 1ª→5ª pernada, cada uma com sua correção + candle de confirmação após a correção da 5ª.
+- Tendência de baixa + 1ª→5ª pernada, cada uma com sua correção + candle de confirmação após a correção da 5ª.
+- Níveis de suporte/resistência também consideram regiões de rejeição/perda de força dos candles.
 - Não exige que todos os critérios estejam presentes ao mesmo tempo.
 - Score mínimo removido da decisão.
 
@@ -121,4 +122,4 @@ DEPLOY
 
 VERSÃO
 -------
-ATR v5.2 FOREX
+ATR v5.2.1 FOREX • Pernadas
