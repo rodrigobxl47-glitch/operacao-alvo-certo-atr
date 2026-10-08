@@ -61,7 +61,7 @@ async function refresh(){
 }
 
 function renderSignals(items){
- if(!items.length){signals.innerHTML='<div class="empty">Nenhum sinal confirmado pela análise-base.</div>';return}
+ if(!items.length){signals.innerHTML='<div class="empty">Nenhum sinal confirmado pela análise atual.</div>';return}
  signals.innerHTML=items.map((x,i)=>`<div class="signal"><div><div class="symbol">${i===0?'🎯 ':''}${x.name} <span class="${x.direction==='CALL'?'call':'put'}">${x.direction==='CALL'?'▲ COMPRA':'▼ VENDA'}</span></div><div class="meta">${x.symbol} • preço ${x.price} • 110 candles fechados em M1/M5/M15</div><div class="meta"><strong>${x.combo||'COMBO'}</strong> • ${x.analysis||''} • Confirmação: ${x.confirmation||''}</div><div class="meta">Suporte forte ${Number(x.support||0).toFixed(5)} • Resistência forte ${Number(x.resistance||0).toFixed(5)}</div><div class="reasons">${(x.reasons||[]).join(' • ')}</div></div></div>`).join('')
 }
 
