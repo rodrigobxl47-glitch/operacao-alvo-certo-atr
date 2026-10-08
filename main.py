@@ -140,11 +140,20 @@ def cluster_levels(points,tol):
     return groups
 
 def strong_support_resistance(cs):
+    # Níveis fortes = extremos do gráfico com repetição/rejeição.
+    # Mantém a ideia de suporte mais baixo e resistência mais alta.
     hi,lo=pivots(cs);ar=max(avg_range(cs[-40:]),1e-12);tol=ar*.45
     supports=[g for g in cluster_levels(lo,tol) if len(g['prices'])>=2]
     resistances=[g for g in cluster_levels(hi,tol) if len(g['prices'])>=2]
-    support=min((g['level'] for g in supports),default=min(x.low for x in cs))
-    resistance=max((g['level'] for g in resistances),default=max(x.high for x in cs))
+    exhaustion_lows=[c.low for c in cs if exhaustion_pivot(c,'CALL',ar)]
+    exhaustion_highs=[c.high for c in cs if exhaustion_pivot(c,'PUT',ar)]
+    support_candidates=[g['level'] for g in supports]+exhaustion_lows
+    resistance_candidates=[g['level'] for g in resistances]+exhaustion_highs
+    support=min(support_candidates,default=min(x.low for x in cs))
+    resistance=max(resistance_candidates,default=max(x.high for x in cs))
+    # Limites reais do período: nunca empurra o nível para fora do gráfico.
+    support=min(support,min(x.low for x in cs))
+    resistance=max(resistance,max(x.high for x in cs))
     return support,resistance
 
 def trend_direction(cs):
@@ -154,11 +163,73 @@ def trend_direction(cs):
     if hi[-1][1]<hi[-2][1] and lo[-1][1]<lo[-2][1]:return 'BAIXA'
     return 'NEUTRA'
 
-def abc_confluence(cs,side):
-    hi,lo=pivots(cs)
-    if len(hi)<2 or len(lo)<2:return False
-    if side=='CALL':return hi[-1][1]>hi[-2][1] and lo[-1][1]>lo[-2][1]
-    return hi[-1][1]<hi[-2][1] and lo[-1][1]<lo[-2][1]
+def exhaustion_pivot(c, side, ar):
+    # Vela de perda de força/rejeição: corpo pequeno ou sombra dominante.
+    b=body(c); r=rng(c)
+    if r<=0:return False
+    if side=='CALL':
+        return (c.close>c.open and (c.low+0.65*r)>=min(c.open,c.close)) or ((c.close-c.low)>=0.55*r and b<=0.55*r)
+    return (c.close<c.open and (c.high-0.65*r)<=max(c.open,c.close)) or ((c.high-c.close)>=0.55*r and b<=0.55*r)
+
+def trend_legs_and_correction(cs,side,max_legs=5):
+    # Procura até 5 pernadas completas, cada uma seguida por uma correção.
+    # A última correção precisa estar concluída antes da vela de confirmação.
+    if len(cs)<35:return 0,False,[]
+    hist=cs[:-1]  # a última vela fica reservada ao gatilho/confirmacao
+    hi,lo=pivots(hist,span=2)
+    ar=max(avg_range(hist[-30:]),1e-12)
+    # Para CALL: L0 -> H1 -> L1 -> H2 -> L2 ... -> H5 -> L5.
+    # Para PUT:  H0 -> L1 -> H1 -> L2 ... -> L5 -> H5.
+    if side=='CALL':
+        lows=[x for x in lo]
+        highs=[x for x in hi]
+        best=None
+        for li in range(max(0,len(lows)-10),len(lows)):
+            l0_idx,l0=lows[li]
+            hs=[h for h in highs if h[0]>l0_idx]
+            for start in range(max(0,len(hs)-8),len(hs)):
+                seq_h=[];seq_l=[];last_idx=l0_idx;last_val=l0
+                hidx=start
+                ok=True
+                for leg in range(1,max_legs+1):
+                    candidates_h=[h for h in hs[hidx:] if h[0]>last_idx and h[1]>last_val]
+                    if not candidates_h: ok=False; break
+                    h=candidates_h[0]
+                    seq_h.append(h)
+                    candidates_l=[l for l in lows if l[0]>h[0] and l[1]>last_val]
+                    if not candidates_l: ok=False; break
+                    l=candidates_l[0]
+                    seq_l.append(l); last_idx,last_val=l
+                    hidx=next((k+1 for k,x in enumerate(hs) if x==h),len(hs))
+                if ok and len(seq_h)==max_legs and len(seq_l)==max_legs:
+                    # A última correção precisa ser a mais recente estrutura e terminar na penúltima vela.
+                    last_corr=seq_l[-1]
+                    if last_corr[0] >= len(hist)-3:
+                        # Garante que a correção não devolveu a estrutura anterior.
+                        if seq_l[-1][1] > l0:
+                            best=(max_legs,True,seq_h+seq_l)
+        if best:return best
+    else:
+        highs=[x for x in hi]
+        lows=[x for x in lo]
+        for hi0 in range(max(0,len(highs)-10),len(highs)):
+            h0_idx,h0=highs[hi0]
+            ls=[l for l in lows if l[0]>h0_idx]
+            for start in range(max(0,len(ls)-8),len(ls)):
+                seq_l=[];seq_h=[];last_idx,last_val=h0_idx,h0;lidx=start;ok=True
+                for leg in range(1,max_legs+1):
+                    cand_l=[l for l in ls[lidx:] if l[0]>last_idx and l[1]<last_val]
+                    if not cand_l:ok=False;break
+                    l=cand_l[0];seq_l.append(l)
+                    cand_h=[h for h in highs if h[0]>l[0] and h[1]<last_val]
+                    if not cand_h:ok=False;break
+                    h=cand_h[0];seq_h.append(h);last_idx,last_val=h
+                    lidx=next((k+1 for k,x in enumerate(ls) if x==l),len(ls))
+                if ok and len(seq_l)==max_legs and len(seq_h)==max_legs:
+                    last_corr=seq_h[-1]
+                    if last_corr[0]>=len(hist)-3 and last_corr[1]<h0:
+                        return max_legs,True,seq_l+seq_h
+    return 0,False,[]
 
 def sr_third_touch_previous(cs,side,support,resistance):
     touch_idx=len(cs)-2;hist=cs[:touch_idx];hi,lo=pivots(hist);pts=lo if side=='CALL' else hi
@@ -196,10 +267,14 @@ def analyze(symbol,name,m1,m5,m15):
             candidates.append((3,side,combo,f'{combo} • 3º toque • próxima vela confirmou',reasons,pat,touch_epoch,signal_epoch))
         expected='ALTA' if side=='CALL' else 'BAIXA'
         t1,t5,t15=trend_direction(m1),trend_direction(m5),trend_direction(m15)
-        if t1==expected and (t5==expected or t15==expected) and abc_confluence(m1,side) and trend_third_touch_previous(m1,side):
+        legs,correction_done,_structure=trend_legs_and_correction(m1,side,max_legs=5)
+        if t1==expected and (t5==expected or t15==expected) and legs==5 and correction_done:
             combo='COMBO TENDÊNCIA ALTA' if side=='CALL' else 'COMBO TENDÊNCIA BAIXA'
-            reasons=[f'Tendência M1: {t1}',f'Contexto M5/M15: {t5}/{t15}','ABC confirmado','3º toque na penúltima vela M1',f'Próxima vela confirmou: {pat}']
-            candidates.append((2,side,combo,f'Tendência {expected} • ABC • 3º toque • próxima vela confirmou',reasons,pat,touch_epoch,signal_epoch))
+            reasons=[f'Tendência M1: {t1}',f'Contexto M5/M15: {t5}/{t15}',
+                     '5ª pernada concluída','Correção da 5ª pernada concluída',
+                     'Gatilho somente após o término da correção',
+                     f'Próxima vela confirmou: {pat}']
+            candidates.append((2,side,combo,f'Tendência {expected} • 5 pernadas + correções • próxima vela confirmou',reasons,pat,touch_epoch,signal_epoch))
     if not candidates:return None
     _,side,combo,analysis,reasons,pat,touch_epoch,signal_epoch=max(candidates,key=lambda z:z[0])
     return Signal(symbol,name,side,m1[-1].close,analysis,pat,combo,reasons,support,resistance,['M1','M5','M15'],signal_epoch,touch_epoch)
@@ -386,7 +461,7 @@ async def scan_once():
             missing=[p for p in FOREX_PAIRS if p not in found]
             state['signals']=[asdict(x) for x in sig[:25]]
             state['last_scan']=int(time.time());state['scanner_heartbeat']=state['last_scan']
-            state['diagnostics']={'pares_forex':len(resolved),'pares_solicitados':FOREX_PAIRS,'pares_encontrados':found,'pares_nao_encontrados':missing,'sinais':len(sig),'candles_por_tf':110,'timeframes':['M1','M5','M15'],'base':'Combos independentes','confluencias':['ABC','3º toque tendência','3º toque suporte/resistência']}
+            state['diagnostics']={'pares_forex':len(resolved),'pares_solicitados':FOREX_PAIRS,'pares_encontrados':found,'pares_nao_encontrados':missing,'sinais':len(sig),'candles_por_tf':110,'timeframes':['M1','M5','M15'],'base':'Combos independentes','confluencias':['5 pernadas + correções','3º toque suporte/resistência','gatilho após correção']}
             await update_news()
             return state['signals']
         finally:
